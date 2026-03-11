@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--telegram-token", default=os.getenv("TELEGRAM_BOT_TOKEN", ""))
     parser.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID", ""))
     parser.add_argument("--market-db-path", default=str(Path("data") / "market_data.sqlite"))
+    parser.add_argument("--require-market-date", default="")
     parser.add_argument("--output", default=str(Path("outputs") / "latest_scan.csv"))
     parser.add_argument("--archive-dir", default=str(Path("outputs") / "archive"))
     parser.add_argument("--report-dir", default=str(Path("reports")))
@@ -336,6 +337,16 @@ def scan_from_market_db(args: argparse.Namespace) -> pd.DataFrame:
         engine = MACDTimeSignalEngine(build_config(args))
         source_name = market_db_source_name(args.period)
         start_bound, end_bound = market_db_bounds(args)
+        if args.require_market_date:
+            required_date = resolve_date_value(args.require_market_date)
+            required_end = pd.Timestamp(required_date).strftime("%Y-%m-%d 23:59:59")
+            latest_date = store.latest_covered_date(args.period, args.adjust, source_name)
+            covered_symbols = store.count_symbols_covered_through(args.period, args.adjust, source_name, required_end)
+            if latest_date is None or latest_date.normalize() < pd.Timestamp(required_date).normalize() or covered_symbols == 0:
+                latest_text = latest_date.strftime("%Y-%m-%d") if latest_date is not None else "none"
+                raise RuntimeError(
+                    f"market-db not fresh enough: require={required_date} latest={latest_text} covered_symbols={covered_symbols}"
+                )
         chunks: list[pd.DataFrame] = []
 
         for _, row in universe.iterrows():

@@ -369,6 +369,35 @@ class MarketDataStore:
             df = df.head(limit).copy()
         return df.reset_index(drop=True)
 
+    def latest_covered_date(self, level: str, adjust: str, source: str) -> pd.Timestamp | None:
+        row = self.conn.execute(
+            """
+            SELECT MAX(max_date)
+            FROM data_coverage
+            WHERE level = ?
+              AND adjust = ?
+              AND source = ?
+            """,
+            (level, adjust, source),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return pd.Timestamp(row[0])
+
+    def count_symbols_covered_through(self, level: str, adjust: str, source: str, target_date: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM data_coverage
+            WHERE level = ?
+              AND adjust = ?
+              AND source = ?
+              AND date(max_date) >= date(?)
+            """,
+            (level, adjust, source, target_date),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def has_kline_coverage(
         self,
         symbol: str,
