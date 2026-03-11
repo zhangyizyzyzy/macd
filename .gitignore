@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.pyc
+.learnings/
+
+state/
+logs/
+reports/
+dist/
+
+data/
+outputs/

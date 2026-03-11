@@ -1,0 +1,651 @@
+//@version=5
+indicator("MACD Time Signal Engine v1.3.0", overlay=true, max_labels_count=500)
+
+// ==============================
+// Inputs
+// ==============================
+
+fastLen = input.int(12, "MACD Fast", minval=1)
+slowLen = input.int(26, "MACD Slow", minval=2)
+sigLen  = input.int(9,  "MACD Signal", minval=1)
+atrLen  = input.int(14, "ATR", minval=1)
+
+epsPriceATR    = input.float(0.20, "Price tolerance in ATR", step=0.01)
+epsZeroATR     = input.float(0.05, "Zero-axis tolerance in ATR", step=0.01)
+revisitBandATR = input.float(0.50, "Revisit band in ATR", step=0.05)
+
+crossWin = input.int(20, "Cross density window", minval=5)
+
+maxCrossLeft = input.float(0.25, "Max cross density - left", step=0.01)
+maxCross1    = input.float(0.20, "Max cross density - 1st buy/sell", step=0.01)
+maxCross2    = input.float(0.20, "Max cross density - 2nd buy/sell", step=0.01)
+maxCross3    = input.float(0.18, "Max cross density - 3rd buy/sell", step=0.01)
+
+minDivVotesLeft = input.int(2, "Min divergence votes - left", minval=1, maxval=4)
+minDivVotes1    = input.int(2, "Min divergence votes - 1", minval=1, maxval=4)
+
+minLeftLag      = input.int(1, "Min left lag", minval=0)
+maxDwellLeft    = input.int(5, "Max dwell left", minval=1)
+maxShrinkAgeLeft= input.int(4, "Max shrink age left", minval=1)
+
+minLag1         = input.int(1, "Min lag 1", minval=0)
+maxLag1         = input.int(8, "Max lag 1", minval=1)
+maxConf1        = input.int(6, "Max confirm 1", minval=1)
+
+pull2AreaRatio  = input.float(0.45, "Pullback area ratio - buy2/sell2", step=0.01)
+minRise1Bars    = input.int(2, "Min rise/drop bars after buy1/sell1", minval=1)
+maxPull2Bars    = input.int(8, "Max pullback bars buy2/sell2", minval=1)
+maxR2           = input.float(0.90, "Max R2", step=0.01)
+maxRevisitLow   = input.int(3, "Max revisit bars near buy1 low", minval=0)
+maxRevisitHigh  = input.int(3, "Max revisit bars near sell1 high", minval=0)
+
+pull3AreaRatio  = input.float(0.40, "Pullback area ratio - buy3/sell3", step=0.01)
+maxPull3Bars    = input.int(6, "Max pullback bars buy3/sell3", minval=1)
+maxB0Bars       = input.int(1, "Max bars back below/above 0 on buy3/sell3", minval=0)
+maxNear0Bars    = input.int(4, "Max near-0 bars on buy3/sell3", minval=0)
+
+showLeft = input.bool(true, "Show left bottom/top")
+showB1S1 = input.bool(true, "Show buy1/sell1")
+showB2S2 = input.bool(true, "Show buy2/sell2")
+showB3S3 = input.bool(true, "Show buy3/sell3")
+
+// ==============================
+// Core series
+// ==============================
+
+dif = ta.ema(close, fastLen) - ta.ema(close, slowLen)
+dea = ta.ema(dif, sigLen)
+bar = dif - dea
+atr = ta.atr(atrLen)
+eps0 = epsZeroATR * atr
+
+crossUp = ta.crossover(bar, 0)
+crossDown = ta.crossunder(bar, 0)
+dualAbove0 = dif > 0 and dea > 0
+dualBelow0 = dif < 0 and dea < 0
+near0 = math.abs(dif) <= eps0 and math.abs(dea) <= eps0
+
+// ==============================
+// Constants / states
+// ==============================
+
+UP = 1
+DOWN = -1
+
+LONG_NONE = 0
+LONG_LEFT_BOTTOM = 1
+LONG_BUY1 = 2
+LONG_PULL2 = 3
+LONG_BUY2 = 4
+LONG_ABOVE0 = 5
+LONG_PULL3 = 6
+LONG_BUY3 = 7
+
+SHORT_NONE = 0
+SHORT_LEFT_TOP = 1
+SHORT_SELL1 = 2
+SHORT_PULL2 = 3
+SHORT_SELL2 = 4
+SHORT_BELOW0 = 5
+SHORT_PULL3 = 6
+SHORT_SELL3 = 7
+
+// ==============================
+// Segment tracking vars
+// ==============================
+
+var int segDir = na
+var int segStart = na
+var int segEnd = na
+var float segStartClose = na
+var float segEndClose = na
+
+var float segLow = na
+var int segLowIdx = na
+var float segHigh = na
+var int segHighIdx = na
+
+var float segBarMin = na
+var int segBarMinIdx = na
+var float segBarMax = na
+var int segBarMaxIdx = na
+
+var float segDifMin = na
+var int segDifMinIdx = na
+var float segDifMax = na
+var int segDifMaxIdx = na
+
+var float segDeaMin = na
+var float segDeaMax = na
+
+var float segAreaAbs = na
+var int segNear0Bars = na
+var int segBelow0Bars = na
+var int segAbove0Bars = na
+
+var int down2_valid = 0
+var float down2_low = na
+var float down2_barMin = na
+var float down2_difMin = na
+var float down2_area = na
+var float down2_eff = na
+var int down2_lowIdx = na
+var int down2_barMinIdx = na
+var int down2_difMinIdx = na
+
+var int down1_valid = 0
+var float down1_low = na
+var float down1_barMin = na
+var float down1_difMin = na
+var float down1_area = na
+var float down1_eff = na
+var int down1_lowIdx = na
+var int down1_barMinIdx = na
+var int down1_difMinIdx = na
+
+var int up2_valid = 0
+var float up2_high = na
+var float up2_barMax = na
+var float up2_difMax = na
+var float up2_area = na
+var float up2_eff = na
+var int up2_highIdx = na
+var int up2_barMaxIdx = na
+var int up2_difMaxIdx = na
+
+var int up1_valid = 0
+var float up1_high = na
+var float up1_barMax = na
+var float up1_difMax = na
+var float up1_area = na
+var float up1_eff = na
+var int up1_highIdx = na
+var int up1_barMaxIdx = na
+var int up1_difMaxIdx = na
+
+// ==============================
+// Long / Short state vars
+// ==============================
+
+var int longState = LONG_NONE
+var int shortState = SHORT_NONE
+
+var int leftBottomIdx = na
+var float leftBottomPrice = na
+var int buy1Idx = na
+var float buy1Price = na
+var float buy1Low = na
+var float buy1MainDownArea = na
+var float buy1MainDownEff = na
+var int pull2StartIdx = na
+var int rise1Bars = na
+var float rise1High = na
+var int buy2Idx = na
+var int zeroUpIdx = na
+var int pull3StartIdx = na
+var int buy3Idx = na
+
+var int leftTopIdx = na
+var float leftTopPrice = na
+var int sell1Idx = na
+var float sell1Price = na
+var float sell1High = na
+var float sell1MainUpArea = na
+var float sell1MainUpEff = na
+var int pull2StartIdxS = na
+var int drop1Bars = na
+var float drop1Low = na
+var int sell2Idx = na
+var int zeroDownIdx = na
+var int pull3StartIdxS = na
+var int sell3Idx = na
+
+// ==============================
+// Helper functions
+// ==============================
+
+crossDensity(win) =>
+    float flips = 0.0
+    for i = 0 to win - 1
+        idx = bar_index - i
+        if idx > 0
+            if (bar[i] > 0 and bar[i + 1] <= 0) or (bar[i] < 0 and bar[i + 1] >= 0)
+                flips += 1
+    flips / win
+
+firstShrinkDown() =>
+    bar_index >= 2 and bar < 0 and math.abs(bar) < math.abs(bar[1]) and math.abs(bar[1]) >= math.abs(bar[2])
+
+firstShrinkUp() =>
+    bar_index >= 2 and bar > 0 and math.abs(bar) < math.abs(bar[1]) and math.abs(bar[1]) >= math.abs(bar[2])
+
+segBars(_start, _end) =>
+    _end - _start + 1
+
+segEffDown(_startClose, _low, _start, _end) =>
+    ((_startClose - _low) / math.max(atr, syminfo.mintick)) / math.max(segBars(_start, _end), 1)
+
+segEffUp(_startClose, _high, _start, _end) =>
+    ((_high - _startClose) / math.max(atr, syminfo.mintick)) / math.max(segBars(_start, _end), 1)
+
+countNearLevelLow(_startBar, _endBar, _level, _bandATR) =>
+    int cnt = 0
+    span = _endBar - _startBar
+    if span >= 0
+        for j = 0 to span
+            off = bar_index - (_startBar + j)
+            if off >= 0
+                if math.abs(low[off] - _level) <= _bandATR * atr[off]
+                    cnt += 1
+    cnt
+
+countNearLevelHigh(_startBar, _endBar, _level, _bandATR) =>
+    int cnt = 0
+    span = _endBar - _startBar
+    if span >= 0
+        for j = 0 to span
+            off = bar_index - (_startBar + j)
+            if off >= 0
+                if math.abs(high[off] - _level) <= _bandATR * atr[off]
+                    cnt += 1
+    cnt
+
+resetLong() =>
+    longState := LONG_NONE
+    leftBottomIdx := na
+    leftBottomPrice := na
+    buy1Idx := na
+    buy1Price := na
+    buy1Low := na
+    buy1MainDownArea := na
+    buy1MainDownEff := na
+    pull2StartIdx := na
+    rise1Bars := na
+    rise1High := na
+    buy2Idx := na
+    zeroUpIdx := na
+    pull3StartIdx := na
+    buy3Idx := na
+
+resetShort() =>
+    shortState := SHORT_NONE
+    leftTopIdx := na
+    leftTopPrice := na
+    sell1Idx := na
+    sell1Price := na
+    sell1High := na
+    sell1MainUpArea := na
+    sell1MainUpEff := na
+    pull2StartIdxS := na
+    drop1Bars := na
+    drop1Low := na
+    sell2Idx := na
+    zeroDownIdx := na
+    pull3StartIdxS := na
+    sell3Idx := na
+
+// ==============================
+// Segment init / update
+// ==============================
+
+initSeg(_dir) =>
+    segDir := _dir
+    segStart := bar_index
+    segEnd := bar_index
+    segStartClose := close
+    segEndClose := close
+    segLow := low
+    segLowIdx := bar_index
+    segHigh := high
+    segHighIdx := bar_index
+    segBarMin := bar
+    segBarMinIdx := bar_index
+    segBarMax := bar
+    segBarMaxIdx := bar_index
+    segDifMin := dif
+    segDifMinIdx := bar_index
+    segDifMax := dif
+    segDifMaxIdx := bar_index
+    segDeaMin := dea
+    segDeaMax := dea
+    segAreaAbs := math.abs(bar)
+    segNear0Bars := near0 ? 1 : 0
+    segBelow0Bars := dualBelow0 ? 1 : 0
+    segAbove0Bars := dualAbove0 ? 1 : 0
+
+updateSeg() =>
+    segEnd := bar_index
+    segEndClose := close
+    if low < segLow
+        segLow := low
+        segLowIdx := bar_index
+    if high > segHigh
+        segHigh := high
+        segHighIdx := bar_index
+    if bar < segBarMin
+        segBarMin := bar
+        segBarMinIdx := bar_index
+    if bar > segBarMax
+        segBarMax := bar
+        segBarMaxIdx := bar_index
+    if dif < segDifMin
+        segDifMin := dif
+        segDifMinIdx := bar_index
+    if dif > segDifMax
+        segDifMax := dif
+        segDifMaxIdx := bar_index
+    segDeaMin := math.min(segDeaMin, dea)
+    segDeaMax := math.max(segDeaMax, dea)
+    segAreaAbs += math.abs(bar)
+    if near0
+        segNear0Bars += 1
+    if dualBelow0
+        segBelow0Bars += 1
+    if dualAbove0
+        segAbove0Bars += 1
+
+closeCurrentDownAndShift() =>
+    down2_valid := down1_valid
+    down2_low := down1_low
+    down2_barMin := down1_barMin
+    down2_difMin := down1_difMin
+    down2_area := down1_area
+    down2_eff := down1_eff
+    down2_lowIdx := down1_lowIdx
+    down2_barMinIdx := down1_barMinIdx
+    down2_difMinIdx := down1_difMinIdx
+
+    down1_valid := 1
+    down1_low := segLow
+    down1_barMin := segBarMin
+    down1_difMin := segDifMin
+    down1_area := segAreaAbs
+    down1_eff := segEffDown(segStartClose, segLow, segStart, segEnd)
+    down1_lowIdx := segLowIdx
+    down1_barMinIdx := segBarMinIdx
+    down1_difMinIdx := segDifMinIdx
+
+closeCurrentUpAndShift() =>
+    up2_valid := up1_valid
+    up2_high := up1_high
+    up2_barMax := up1_barMax
+    up2_difMax := up1_difMax
+    up2_area := up1_area
+    up2_eff := up1_eff
+    up2_highIdx := up1_highIdx
+    up2_barMaxIdx := up1_barMaxIdx
+    up2_difMaxIdx := up1_difMaxIdx
+
+    up1_valid := 1
+    up1_high := segHigh
+    up1_barMax := segBarMax
+    up1_difMax := segDifMax
+    up1_area := segAreaAbs
+    up1_eff := segEffUp(segStartClose, segHigh, segStart, segEnd)
+    up1_highIdx := segHighIdx
+    up1_barMaxIdx := segBarMaxIdx
+    up1_difMaxIdx := segDifMaxIdx
+
+// ==============================
+// Init
+// ==============================
+
+if barstate.isfirst
+    initSeg(bar >= 0 ? UP : DOWN)
+else
+    if not crossUp and not crossDown
+        updateSeg()
+
+        leftBottom = false
+        if segDir == DOWN and down1_valid == 1
+            priceNewLow = segLow <= down1_low + epsPriceATR * atr
+            votes = 0
+            votes += segBarMin > down1_barMin ? 1 : 0
+            votes += segDifMin > down1_difMin ? 1 : 0
+            votes += segAreaAbs < down1_area ? 1 : 0
+            votes += segEffDown(segStartClose, segLow, segStart, segEnd) < down1_eff ? 1 : 0
+
+            lagBar = segLowIdx - segBarMinIdx
+            lagDif = segLowIdx - segDifMinIdx
+            lagOK = math.max(lagBar, lagDif) >= minLeftLag
+            dwell = bar_index - segLowIdx
+            shrinkAge = bar_index - segBarMinIdx
+            noise = crossDensity(crossWin)
+
+            leftBottom := dualBelow0 and priceNewLow and votes >= minDivVotesLeft and lagOK and firstShrinkDown() and dwell <= maxDwellLeft and shrinkAge <= maxShrinkAgeLeft and noise <= maxCrossLeft
+
+        if leftBottom and showLeft
+            if longState == LONG_NONE
+                longState := LONG_LEFT_BOTTOM
+                leftBottomIdx := bar_index
+                leftBottomPrice := low
+            label.new(bar_index, low, "LB", style=label.style_label_up, textcolor=color.white, color=color.new(color.fuchsia, 0), size=size.tiny)
+
+        leftTop = false
+        if segDir == UP and up1_valid == 1
+            priceNewHigh = segHigh >= up1_high - epsPriceATR * atr
+            votes = 0
+            votes += segBarMax < up1_barMax ? 1 : 0
+            votes += segDifMax < up1_difMax ? 1 : 0
+            votes += segAreaAbs < up1_area ? 1 : 0
+            votes += segEffUp(segStartClose, segHigh, segStart, segEnd) < up1_eff ? 1 : 0
+
+            lagBar = segHighIdx - segBarMaxIdx
+            lagDif = segHighIdx - segDifMaxIdx
+            lagOK = math.max(lagBar, lagDif) >= minLeftLag
+            dwell = bar_index - segHighIdx
+            shrinkAge = bar_index - segBarMaxIdx
+            noise = crossDensity(crossWin)
+
+            leftTop := dualAbove0 and priceNewHigh and votes >= minDivVotesLeft and lagOK and firstShrinkUp() and dwell <= maxDwellLeft and shrinkAge <= maxShrinkAgeLeft and noise <= maxCrossLeft
+
+        if leftTop and showLeft
+            if shortState == SHORT_NONE
+                shortState := SHORT_LEFT_TOP
+                leftTopIdx := bar_index
+                leftTopPrice := high
+            label.new(bar_index, high, "LT", style=label.style_label_down, textcolor=color.white, color=color.new(color.blue, 0), size=size.tiny)
+
+    if crossUp
+        closedLow = segLow
+        closedLowIdx = segLowIdx
+        closedBarMin = segBarMin
+        closedBarMinIdx = segBarMinIdx
+        closedDifMin = segDifMin
+        closedDifMinIdx = segDifMinIdx
+        closedArea = segAreaAbs
+        closedEff = segEffDown(segStartClose, segLow, segStart, bar_index - 1)
+        closedBelow0 = segBelow0Bars
+        closedNear0 = segNear0Bars
+
+        buy1 = false
+        if down1_valid == 1
+            priceNewLow = closedLow <= down1_low + epsPriceATR * atr
+            votes = 0
+            votes += closedBarMin > down1_barMin ? 1 : 0
+            votes += closedDifMin > down1_difMin ? 1 : 0
+            votes += closedArea < down1_area ? 1 : 0
+            votes += closedEff < down1_eff ? 1 : 0
+
+            lagBar = closedLowIdx - closedBarMinIdx
+            lagDif = closedLowIdx - closedDifMinIdx
+            lag = math.max(lagBar, lagDif)
+            tConf1Buy = bar_index - closedLowIdx
+            noise = crossDensity(crossWin)
+
+            buy1 := dif < 0 and dea < 0 and priceNewLow and votes >= minDivVotes1 and lag >= minLag1 and lag <= maxLag1 and tConf1Buy <= maxConf1 and noise <= maxCross1
+
+        buy2 = false
+        if not na(buy1Idx) and not na(pull2StartIdx)
+            tRise1 = rise1Bars
+            tPull2 = bar_index - pull2StartIdx
+            r2 = tPull2 / math.max(tRise1, 1)
+            notBreakBuy1 = closedLow >= buy1Low - epsPriceATR * atr
+            revisitLowBars = countNearLevelLow(pull2StartIdx, bar_index - 1, buy1Low, revisitBandATR)
+            areaOK = closedArea <= pull2AreaRatio * buy1MainDownArea
+            noise = crossDensity(crossWin)
+
+            buy2 := notBreakBuy1 and tRise1 >= minRise1Bars and tPull2 <= maxPull2Bars and r2 <= maxR2 and revisitLowBars <= maxRevisitLow and areaOK and noise <= maxCross2
+
+        buy3 = false
+        if not na(zeroUpIdx) and not na(pull3StartIdx)
+            tPull3 = bar_index - pull3StartIdx
+            b0 = closedBelow0
+            near0bars = closedNear0
+            areaOK = closedArea <= pull3AreaRatio * buy1MainDownArea
+            noise = crossDensity(crossWin)
+
+            buy3 := tPull3 <= maxPull3Bars and b0 <= maxB0Bars and near0bars <= maxNear0Bars and areaOK and noise <= maxCross3
+
+        if buy3 and showB3S3
+            longState := LONG_BUY3
+            buy3Idx := bar_index
+            resetShort()
+            label.new(bar_index, low, "B3", style=label.style_label_up, textcolor=color.white, color=color.new(color.orange, 0), size=size.small)
+        else if buy2 and showB2S2
+            longState := LONG_BUY2
+            buy2Idx := bar_index
+            resetShort()
+            label.new(bar_index, low, "B2", style=label.style_label_up, textcolor=color.white, color=color.new(color.aqua, 0), size=size.small)
+        else if buy1 and showB1S1
+            longState := LONG_BUY1
+            buy1Idx := bar_index
+            buy1Price := close
+            buy1Low := closedLow
+            buy1MainDownArea := closedArea
+            buy1MainDownEff := closedEff
+
+            pull2StartIdx := na
+            rise1Bars := na
+            rise1High := na
+            buy2Idx := na
+            zeroUpIdx := na
+            pull3StartIdx := na
+            buy3Idx := na
+
+            resetShort()
+            label.new(bar_index, low, "B1", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0), size=size.small)
+
+        closeCurrentDownAndShift()
+        initSeg(UP)
+
+    if crossDown
+        closedHigh = segHigh
+        closedHighIdx = segHighIdx
+        closedBarMax = segBarMax
+        closedBarMaxIdx = segBarMaxIdx
+        closedDifMax = segDifMax
+        closedDifMaxIdx = segDifMaxIdx
+        closedArea = segAreaAbs
+        closedEff = segEffUp(segStartClose, segHigh, segStart, bar_index - 1)
+        closedAbove0 = segAbove0Bars
+        closedNear0 = segNear0Bars
+
+        sell1 = false
+        if up1_valid == 1
+            priceNewHigh = closedHigh >= up1_high - epsPriceATR * atr
+            votes = 0
+            votes += closedBarMax < up1_barMax ? 1 : 0
+            votes += closedDifMax < up1_difMax ? 1 : 0
+            votes += closedArea < up1_area ? 1 : 0
+            votes += closedEff < up1_eff ? 1 : 0
+
+            lagBar = closedHighIdx - closedBarMaxIdx
+            lagDif = closedHighIdx - closedDifMaxIdx
+            lag = math.max(lagBar, lagDif)
+            tConf1Sell = bar_index - closedHighIdx
+            noise = crossDensity(crossWin)
+
+            sell1 := dif > 0 and dea > 0 and priceNewHigh and votes >= minDivVotes1 and lag >= minLag1 and lag <= maxLag1 and tConf1Sell <= maxConf1 and noise <= maxCross1
+
+        sell2 = false
+        if not na(sell1Idx) and not na(pull2StartIdxS)
+            tDrop1 = drop1Bars
+            tPull2 = bar_index - pull2StartIdxS
+            r2 = tPull2 / math.max(tDrop1, 1)
+            notBreakSell1 = closedHigh <= sell1High + epsPriceATR * atr
+            revisitHighBars = countNearLevelHigh(pull2StartIdxS, bar_index - 1, sell1High, revisitBandATR)
+            areaOK = closedArea <= pull2AreaRatio * sell1MainUpArea
+            noise = crossDensity(crossWin)
+
+            sell2 := notBreakSell1 and tDrop1 >= minRise1Bars and tPull2 <= maxPull2Bars and r2 <= maxR2 and revisitHighBars <= maxRevisitHigh and areaOK and noise <= maxCross2
+
+        sell3 = false
+        if not na(zeroDownIdx) and not na(pull3StartIdxS)
+            tPull3 = bar_index - pull3StartIdxS
+            a0 = closedAbove0
+            near0bars = closedNear0
+            areaOK = closedArea <= pull3AreaRatio * sell1MainUpArea
+            noise = crossDensity(crossWin)
+
+            sell3 := tPull3 <= maxPull3Bars and a0 <= maxB0Bars and near0bars <= maxNear0Bars and areaOK and noise <= maxCross3
+
+        if sell3 and showB3S3
+            shortState := SHORT_SELL3
+            sell3Idx := bar_index
+            resetLong()
+            label.new(bar_index, high, "S3", style=label.style_label_down, textcolor=color.white, color=color.new(color.gray, 0), size=size.small)
+        else if sell2 and showB2S2
+            shortState := SHORT_SELL2
+            sell2Idx := bar_index
+            resetLong()
+            label.new(bar_index, high, "S2", style=label.style_label_down, textcolor=color.white, color=color.new(color.purple, 0), size=size.small)
+        else if sell1 and showB1S1
+            shortState := SHORT_SELL1
+            sell1Idx := bar_index
+            sell1Price := close
+            sell1High := closedHigh
+            sell1MainUpArea := closedArea
+            sell1MainUpEff := closedEff
+
+            pull2StartIdxS := na
+            drop1Bars := na
+            drop1Low := na
+            sell2Idx := na
+            zeroDownIdx := na
+            pull3StartIdxS := na
+            sell3Idx := na
+
+            resetLong()
+            label.new(bar_index, high, "S1", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0), size=size.small)
+
+        closeCurrentUpAndShift()
+        initSeg(DOWN)
+
+    if not na(buy1Idx) and na(zeroUpIdx) and dualAbove0
+        zeroUpIdx := bar_index
+        longState := LONG_ABOVE0
+
+    if not na(sell1Idx) and na(zeroDownIdx) and dualBelow0
+        zeroDownIdx := bar_index
+        shortState := SHORT_BELOW0
+
+    if crossDown and not na(buy1Idx) and na(zeroUpIdx)
+        longState := LONG_PULL2
+        pull2StartIdx := bar_index
+        rise1Bars := bar_index - buy1Idx
+        rise1High := ta.highest(high, math.max(rise1Bars, 1))
+
+    if crossUp and not na(sell1Idx) and na(zeroDownIdx)
+        shortState := SHORT_PULL2
+        pull2StartIdxS := bar_index
+        drop1Bars := bar_index - sell1Idx
+        drop1Low := ta.lowest(low, math.max(drop1Bars, 1))
+
+    if crossDown and not na(zeroUpIdx)
+        longState := LONG_PULL3
+        pull3StartIdx := bar_index
+
+    if crossUp and not na(zeroDownIdx)
+        shortState := SHORT_PULL3
+        pull3StartIdxS := bar_index
+
+    if not na(buy1Low) and low < buy1Low - epsPriceATR * atr
+        resetLong()
+
+    if not na(sell1High) and high > sell1High + epsPriceATR * atr
+        resetShort()
+
+plot(dif, "DIF", color=color.new(color.green, 0), display=display.none)
+plot(dea, "DEA", color=color.new(color.orange, 0), display=display.none)
+plot(bar, "BAR", style=plot.style_histogram, color=bar >= 0 ? color.new(color.teal, 0) : color.new(color.red, 0), display=display.none)
