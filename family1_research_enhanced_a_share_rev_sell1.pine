@@ -1,0 +1,385 @@
+//@version=6
+indicator("Family1 A-Share Rev SELL1 Check", overlay=true, max_labels_count=500, max_lines_count=500)
+
+showRawSignals = input.bool(false, "Show Raw BUY1/SELL1")
+showFilteredSignals = input.bool(true, "Show Filtered BUY1/SELL1")
+showTradeMarks = input.bool(true, "Show Entry/Exit Marks")
+showDebug = input.bool(true, "Show Debug Labels")
+stopBufferATR = input.float(0.20, "Stop Buffer ATR", step=0.01)
+
+epsPriceATR = input.float(0.20, "Price tolerance in ATR", step=0.01)
+crossWin = input.int(20, "Cross density window", minval=5)
+maxCross1 = input.float(0.20, "Max cross density - BUY1/SELL1", step=0.01)
+minDivVotes1 = input.int(2, "Min divergence votes - 1", minval=1, maxval=4)
+minLag1 = input.int(1, "Min lag 1", minval=0)
+maxLag1 = input.int(8, "Max lag 1", minval=1)
+maxConf1 = input.int(6, "Max confirm 1", minval=1)
+
+signalTf = timeframe.period
+supportedTf = signalTf == "15" or signalTf == "60" or signalTf == "240"
+if not supportedTf
+    runtime.error("Use this script on 15m / 60m / 240m charts.")
+
+gateTf = signalTf == "15" ? "D" : signalTf == "60" ? "240" : "W"
+transitionTf = signalTf == "240" ? "W" : "240"
+maxHoldBars = signalTf == "15" ? 80 : signalTf == "60" ? 20 : 5
+
+UP = 1
+DOWN = -1
+
+flipStateStr(stateValue) =>
+    stateValue == "ABOVE" ? "BELOW" : "ABOVE"
+
+f_macd_line(_src) =>
+    ta.ema(_src, 12) - ta.ema(_src, 26)
+
+f_signal_line(_src) =>
+    ta.ema(f_macd_line(_src), 9)
+
+f_hist_line(_src) =>
+    _macd = f_macd_line(_src)
+    _signal = ta.ema(_macd, 9)
+    _macd - _signal
+
+buildGateLabel(zone, relation) =>
+    zone == "ABOVE" and relation == "ABOVE" ? "ABOVE_GREEN" :
+     zone == "ABOVE" and relation == "BELOW" ? "ABOVE_RED" :
+     zone == "BELOW" and relation == "ABOVE" ? "BELOW_GREEN" : "BELOW_RED"
+
+crossDensity(win, histValue) =>
+    float flips = 0.0
+    for i = 0 to win - 1
+        idx = bar_index - i
+        if idx > 0
+            if (histValue[i] > 0 and histValue[i + 1] <= 0) or (histValue[i] < 0 and histValue[i + 1] >= 0)
+                flips += 1
+    flips / win
+
+segBars(_start, _end) =>
+    _end - _start + 1
+
+segEffDown(_startClose, _low, _start, _end, _atr) =>
+    ((_startClose - _low) / math.max(_atr, syminfo.mintick)) / math.max(segBars(_start, _end), 1)
+
+segEffUp(_startClose, _high, _start, _end, _atr) =>
+    ((_high - _startClose) / math.max(_atr, syminfo.mintick)) / math.max(segBars(_start, _end), 1)
+
+dif = ta.ema(close, 12) - ta.ema(close, 26)
+dea = ta.ema(dif, 9)
+hist = dif - dea
+atr = ta.atr(14)
+
+crossUp = ta.crossover(hist, 0)
+crossDown = ta.crossunder(hist, 0)
+
+// Segment state
+var int segDir = na
+var int segStart = na
+var float segStartClose = na
+var float segLow = na
+var int segLowIdx = na
+var float segHigh = na
+var int segHighIdx = na
+var float segBarMin = na
+var int segBarMinIdx = na
+var float segBarMax = na
+var int segBarMaxIdx = na
+var float segDifMin = na
+var int segDifMinIdx = na
+var float segDifMax = na
+var int segDifMaxIdx = na
+var float segAreaAbs = na
+
+// Previous closed down segment
+var bool prevDownValid = false
+var float prevDownLow = na
+var float prevDownBarMin = na
+var float prevDownDifMin = na
+var float prevDownArea = na
+var float prevDownEff = na
+var int prevDownLowIdx = na
+var int prevDownBarMinIdx = na
+var int prevDownDifMinIdx = na
+
+// Previous closed up segment
+var bool prevUpValid = false
+var float prevUpHigh = na
+var float prevUpBarMax = na
+var float prevUpDifMax = na
+var float prevUpArea = na
+var float prevUpEff = na
+var int prevUpHighIdx = na
+var int prevUpBarMaxIdx = na
+var int prevUpDifMaxIdx = na
+
+// Higher-timeframe gate and transition
+gateMacd = request.security(syminfo.tickerid, gateTf, f_macd_line(close), barmerge.gaps_off, barmerge.lookahead_off)
+gateDea = request.security(syminfo.tickerid, gateTf, f_signal_line(close), barmerge.gaps_off, barmerge.lookahead_off)
+var string gateZone = "BELOW"
+var string gateRelation = "BELOW"
+gateZone := gateMacd > 0 ? "ABOVE" : gateMacd < 0 ? "BELOW" : na(gateZone[1]) ? "BELOW" : flipStateStr(gateZone[1])
+gateRelation := gateMacd > gateDea ? "ABOVE" : gateMacd < gateDea ? "BELOW" : na(gateRelation[1]) ? "BELOW" : flipStateStr(gateRelation[1])
+gateLabel = buildGateLabel(gateZone, gateRelation)
+gateAllowedBuy = not (gateZone == "BELOW" and gateRelation == "BELOW")
+gateAllowedSell = not (gateZone == "ABOVE" and gateRelation == "ABOVE")
+
+transitionHist = request.security(syminfo.tickerid, transitionTf, f_hist_line(close), barmerge.gaps_off, barmerge.lookahead_off)
+transitionHistPrev = request.security(syminfo.tickerid, transitionTf, f_hist_line(close)[1], barmerge.gaps_off, barmerge.lookahead_off)
+sameSignHigher = transitionHist * transitionHistPrev > 0
+lighteningHigher = sameSignHigher and math.abs(transitionHist) < math.abs(transitionHistPrev)
+deepeningHigher = sameSignHigher and math.abs(transitionHist) > math.abs(transitionHistPrev)
+flipToGreenHigher = transitionHistPrev < 0 and transitionHist > 0
+flipToRedHigher = transitionHistPrev > 0 and transitionHist < 0
+
+buyPhase = lighteningHigher and transitionHist < 0 ? "red_lightening" :
+     flipToGreenHigher ? "first_green" :
+     (transitionHist > 0 and transitionHistPrev > 0 and deepeningHigher ? "green_deepening" : "")
+
+sellPhase = lighteningHigher and transitionHist > 0 ? "green_lightening" :
+     flipToRedHigher ? "first_red" :
+     (transitionHist < 0 and transitionHistPrev < 0 and deepeningHigher ? "red_deepening" : "")
+
+transitionAllowedBuy = buyPhase != ""
+transitionAllowedSell = sellPhase != ""
+
+bool rawBuy1 = false
+bool rawSell1 = false
+float buy1LowSignal = na
+float sell1HighSignal = na
+
+if barstate.isfirst
+    segDir := hist >= 0 ? UP : DOWN
+    segStart := bar_index
+    segStartClose := close
+    segLow := low
+    segLowIdx := bar_index
+    segHigh := high
+    segHighIdx := bar_index
+    segBarMin := hist
+    segBarMinIdx := bar_index
+    segBarMax := hist
+    segBarMaxIdx := bar_index
+    segDifMin := dif
+    segDifMinIdx := bar_index
+    segDifMax := dif
+    segDifMaxIdx := bar_index
+    segAreaAbs := math.abs(hist)
+else
+    rawBuy1 := false
+    rawSell1 := false
+    buy1LowSignal := na
+    sell1HighSignal := na
+
+    if not crossUp and not crossDown
+        if low < segLow
+            segLow := low
+            segLowIdx := bar_index
+        if high > segHigh
+            segHigh := high
+            segHighIdx := bar_index
+        if hist < segBarMin
+            segBarMin := hist
+            segBarMinIdx := bar_index
+        if hist > segBarMax
+            segBarMax := hist
+            segBarMaxIdx := bar_index
+        if dif < segDifMin
+            segDifMin := dif
+            segDifMinIdx := bar_index
+        if dif > segDifMax
+            segDifMax := dif
+            segDifMaxIdx := bar_index
+        segAreaAbs += math.abs(hist)
+
+    if crossUp
+        closedLow = segLow
+        closedLowIdx = segLowIdx
+        closedBarMin = segBarMin
+        closedBarMinIdx = segBarMinIdx
+        closedDifMin = segDifMin
+        closedDifMinIdx = segDifMinIdx
+        closedArea = segAreaAbs
+        closedEff = segEffDown(segStartClose, segLow, segStart, bar_index - 1, atr)
+
+        if prevDownValid
+            priceNewLow = closedLow <= prevDownLow + epsPriceATR * atr
+            votes = 0
+            votes += closedBarMin > prevDownBarMin ? 1 : 0
+            votes += closedDifMin > prevDownDifMin ? 1 : 0
+            votes += closedArea < prevDownArea ? 1 : 0
+            votes += closedEff < prevDownEff ? 1 : 0
+            lagBar = closedLowIdx - closedBarMinIdx
+            lagDif = closedLowIdx - closedDifMinIdx
+            lag = math.max(lagBar, lagDif)
+            tConf1Buy = bar_index - closedLowIdx
+            noise = crossDensity(crossWin, hist)
+            rawBuy1 := dif < 0 and dea < 0 and priceNewLow and votes >= minDivVotes1 and lag >= minLag1 and lag <= maxLag1 and tConf1Buy <= maxConf1 and noise <= maxCross1
+            if rawBuy1
+                buy1LowSignal := closedLow
+
+        prevDownValid := true
+        prevDownLow := closedLow
+        prevDownBarMin := closedBarMin
+        prevDownDifMin := closedDifMin
+        prevDownArea := closedArea
+        prevDownEff := closedEff
+        prevDownLowIdx := closedLowIdx
+        prevDownBarMinIdx := closedBarMinIdx
+        prevDownDifMinIdx := closedDifMinIdx
+        segDir := UP
+        segStart := bar_index
+        segStartClose := close
+        segLow := low
+        segLowIdx := bar_index
+        segHigh := high
+        segHighIdx := bar_index
+        segBarMin := hist
+        segBarMinIdx := bar_index
+        segBarMax := hist
+        segBarMaxIdx := bar_index
+        segDifMin := dif
+        segDifMinIdx := bar_index
+        segDifMax := dif
+        segDifMaxIdx := bar_index
+        segAreaAbs := math.abs(hist)
+
+    if crossDown
+        closedHigh = segHigh
+        closedHighIdx = segHighIdx
+        closedBarMax = segBarMax
+        closedBarMaxIdx = segBarMaxIdx
+        closedDifMax = segDifMax
+        closedDifMaxIdx = segDifMaxIdx
+        closedArea = segAreaAbs
+        closedEff = segEffUp(segStartClose, segHigh, segStart, bar_index - 1, atr)
+
+        if prevUpValid
+            priceNewHigh = closedHigh >= prevUpHigh - epsPriceATR * atr
+            votes = 0
+            votes += closedBarMax < prevUpBarMax ? 1 : 0
+            votes += closedDifMax < prevUpDifMax ? 1 : 0
+            votes += closedArea < prevUpArea ? 1 : 0
+            votes += closedEff < prevUpEff ? 1 : 0
+            lagBar = closedHighIdx - closedBarMaxIdx
+            lagDif = closedHighIdx - closedDifMaxIdx
+            lag = math.max(lagBar, lagDif)
+            tConf1Sell = bar_index - closedHighIdx
+            noise = crossDensity(crossWin, hist)
+            rawSell1 := dif > 0 and dea > 0 and priceNewHigh and votes >= minDivVotes1 and lag >= minLag1 and lag <= maxLag1 and tConf1Sell <= maxConf1 and noise <= maxCross1
+            if rawSell1
+                sell1HighSignal := closedHigh
+
+        prevUpValid := true
+        prevUpHigh := closedHigh
+        prevUpBarMax := closedBarMax
+        prevUpDifMax := closedDifMax
+        prevUpArea := closedArea
+        prevUpEff := closedEff
+        prevUpHighIdx := closedHighIdx
+        prevUpBarMaxIdx := closedBarMaxIdx
+        prevUpDifMaxIdx := closedDifMaxIdx
+        segDir := DOWN
+        segStart := bar_index
+        segStartClose := close
+        segLow := low
+        segLowIdx := bar_index
+        segHigh := high
+        segHighIdx := bar_index
+        segBarMin := hist
+        segBarMinIdx := bar_index
+        segBarMax := hist
+        segBarMaxIdx := bar_index
+        segDifMin := dif
+        segDifMinIdx := bar_index
+        segDifMax := dif
+        segDifMaxIdx := bar_index
+        segAreaAbs := math.abs(hist)
+
+buy1Allowed = rawBuy1 and gateAllowedBuy and transitionAllowedBuy
+sell1Allowed = rawSell1 and gateAllowedSell and transitionAllowedSell
+
+// A-share execution check: next-bar open entry, structural stop, reverse SELL1 exit, time fallback
+var bool pendingEntry = false
+var float pendingEntryLow = na
+var float pendingEntryAtr = na
+var bool inLong = false
+var float longEntryPrice = na
+var float longStopPrice = na
+var int longEntryBar = na
+var bool pendingExit = false
+var string pendingExitReason = ""
+var float pendingExitTriggerPrice = na
+
+bool entryFill = false
+bool exitFill = false
+string exitReasonText = ""
+float entryFillPrice = na
+float exitFillPrice = na
+
+if pendingExit and inLong
+    exitFill := true
+    exitFillPrice := open
+    exitReasonText := pendingExitReason == "STRUCT_STOP" and open < pendingExitTriggerPrice ? "STRUCT_STOP_GAP" : pendingExitReason
+    inLong := false
+    longEntryPrice := na
+    longStopPrice := na
+    longEntryBar := na
+    pendingExit := false
+    pendingExitReason := ""
+    pendingExitTriggerPrice := na
+
+if pendingEntry and not inLong
+    candidateStop = pendingEntryLow - stopBufferATR * pendingEntryAtr
+    if open > candidateStop
+        inLong := true
+        longEntryPrice := open
+        longStopPrice := candidateStop
+        longEntryBar := bar_index
+        entryFill := true
+        entryFillPrice := open
+    pendingEntry := false
+    pendingEntryLow := na
+    pendingEntryAtr := na
+
+if inLong and not pendingExit
+    holdBars = bar_index - longEntryBar + 1
+    if low <= longStopPrice
+        pendingExit := true
+        pendingExitReason := "STRUCT_STOP"
+        pendingExitTriggerPrice := longStopPrice
+    else if sell1Allowed
+        pendingExit := true
+        pendingExitReason := "REV_SELL1"
+        pendingExitTriggerPrice := close
+    else if holdBars >= maxHoldBars
+        pendingExit := true
+        pendingExitReason := "TIME"
+        pendingExitTriggerPrice := close
+
+if not inLong and not pendingEntry and buy1Allowed and not na(buy1LowSignal)
+    pendingEntry := true
+    pendingEntryLow := buy1LowSignal
+    pendingEntryAtr := atr
+
+plotshape(showRawSignals and rawBuy1, title="Raw BUY1", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 70), size=size.tiny, text="RB1")
+plotshape(showRawSignals and rawSell1, title="Raw SELL1", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 70), size=size.tiny, text="RS1")
+plotshape(showFilteredSignals and buy1Allowed, title="Filtered BUY1", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="B1", textcolor=color.white, size=size.small)
+plotshape(showFilteredSignals and sell1Allowed, title="Filtered SELL1", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="S1", textcolor=color.white, size=size.small)
+plotshape(showTradeMarks and entryFill, title="Entry Fill", style=shape.circle, location=location.belowbar, color=color.new(color.aqua, 0), size=size.tiny, text="IN")
+plotshape(showTradeMarks and exitFill, title="Exit Fill", style=shape.circle, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="OUT")
+plot(inLong ? longStopPrice : na, "Struct Stop", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+bgcolor(inLong ? color.new(color.green, 92) : na)
+
+if showDebug and buy1Allowed
+    label.new(bar_index, low, "B1\nGate:" + gateLabel + "\nPhase:" + buyPhase, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.tiny)
+if showDebug and sell1Allowed
+    label.new(bar_index, high, "S1\nGate:" + gateLabel + "\nPhase:" + sellPhase, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
+if showTradeMarks and entryFill
+    label.new(bar_index, low, "Entry @" + str.tostring(entryFillPrice, format.mintick), style=label.style_label_up, color=color.new(color.aqua, 0), textcolor=color.black, size=size.tiny)
+if showTradeMarks and exitFill
+    label.new(bar_index, high, exitReasonText + "\n@" + str.tostring(exitFillPrice, format.mintick), style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.black, size=size.tiny)
+
+alertcondition(buy1Allowed, "Filtered BUY1", "Filtered BUY1")
+alertcondition(sell1Allowed, "Filtered SELL1", "Filtered SELL1")
+alertcondition(entryFill, "Entry Fill", "Next-bar open entry filled")
+alertcondition(exitFill, "Exit Fill", "Next-bar open exit filled")

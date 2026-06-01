@@ -206,6 +206,86 @@ SQLite 里会保存这些表：
 
 当前分钟级长历史默认走 `baostock`，`120m / 240m` 由更细分钟线聚合生成。首轮建库会慢一些，后续同参数重跑会直接优先命中 SQLite 和本地缓存。
 
+## MACD第二版 A股化
+
+当前已经落地第一套独立回测脚本：
+
+```bash
+python macd_family1_research_enhanced_backtest.py \
+  --start-date 20240101 \
+  --end-date 20260310
+```
+
+默认行为：
+
+- 股票池使用当前 `沪深300` 成分股
+- 股票池缓存到 `data/hs300_current.csv`
+- 数据直接读取 `data/market_data.sqlite`
+- 输出交易明细到 `outputs/family1_research_enhanced_a_share_trades.csv`
+- 输出汇总到 `outputs/family1_research_enhanced_a_share_summary.csv`
+- 输出逐股票汇总到 `outputs/family1_research_enhanced_a_share_symbols.csv`
+
+当前 `研究增强版` 的 A 股化口径固定为：
+
+- 只做 `多头`
+- 只用 `15m BUY1`
+- 保留 `日线 gate`
+- 保留 `4h 逐根放宽`
+  - A 股里按交易日 `240m` 会话投影处理
+- 信号确认后按“下一根同级别 K 线开盘价”追入
+- 结构止损使用 `buy1_low - 0.2 * ATR`
+- 止盈改成“遇到镜像筛选后的反向 `SELL1` 平仓”
+- 仍保留 `80` 根 `15m` 等效时间退出
+- 出场按“下一根同级别 K 线开盘价”市价执行，并做 A 股 `gap` 处理
+
+烟测命令：
+
+```bash
+python macd_family1_research_enhanced_backtest.py \
+  --symbols 000001,600519,300750 \
+  --start-date 20240101 \
+  --end-date 20260310 \
+  --output outputs/family1_smoke_trades.csv \
+  --summary-output outputs/family1_smoke_summary.csv \
+  --symbol-summary-output outputs/family1_smoke_symbols.csv
+```
+
+`Backtrader` 对接版：
+
+```bash
+python backtrader_family1_research_enhanced_backtest.py \
+  --start-date 20240101 \
+  --end-date 20260310
+```
+
+默认输出：
+
+- `outputs/family1_research_enhanced_a_share_bt_trades.csv`
+- `outputs/family1_research_enhanced_a_share_bt_summary.csv`
+- `outputs/family1_research_enhanced_a_share_bt_symbols.csv`
+
+当前这版 `Backtrader` 接入方式是：
+
+- 股票池、信号筛选、`日线 gate`、`4h` 过渡条件与自研版共用一套规则
+- 交易生命周期交给 `Backtrader` 的事件循环执行
+- 当前默认执行口径是 A 股化版本：
+  - 下一根同级别 `open` 追入
+  - `buy1_low - 0.2 * ATR` 结构止损
+  - 反向筛选后的 `SELL1` 触发平仓
+  - 下一根同级别 `open` 市价出场
+  - `80` 根等效持仓上限作为时间兜底
+
+图上检查版 Pine 已放到：
+
+- `family1_research_enhanced_a_share_rev_sell1.pine`
+
+这份脚本用于在 `15m / 60m / 240m` 图表上直接看：
+
+- 原始 `BUY1 / SELL1`
+- 过滤后的 `BUY1 / SELL1`
+- 下一根开盘模拟入场
+- 结构止损 / 反向 `SELL1` / 时间退出
+
 ## 本地行情库
 
 正式行情底库默认在：

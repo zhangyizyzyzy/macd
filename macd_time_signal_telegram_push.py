@@ -14,7 +14,7 @@ import pandas as pd
 
 from market_data_store import MarketDataStore
 from macd_time_signal_scanner import PROJECT_VERSION, ScanConfig, run_universe_scan, save_output
-from macd_time_signal_scanner import MACDTimeSignalEngine
+from macd_time_signal_scanner import AKShareProvider, MACDTimeSignalEngine, compute_indicators, ema
 
 
 ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -211,6 +211,50 @@ def filter_by_date(df: pd.DataFrame, date_value: str) -> pd.DataFrame:
     return df[df["date"].dt.normalize() == target].copy()
 
 
+def apply_weekly_dif_gate(df: pd.DataFrame) -> pd.DataFrame:
+    """对 BUY2/SELL2 信号查周线 DIF 方向，调整 score 加分。"""
+    if df.empty:
+        return df
+    buy2_sell2 = df[df["signal"].isin({"BUY2", "SELL2"})]
+    if buy2_sell2.empty:
+        return df
+
+    symbols = buy2_sell2["symbol"].unique().tolist()
+    provider = AKShareProvider()
+    weekly_cfg = ScanConfig(period="weekly", start_date="20220101", workers=1, recent_bars=9999, latest_only=False)
+    weekly_dif_map: dict[str, float] = {}
+
+    for sym in symbols:
+        try:
+            hist = provider.get_history(str(sym), weekly_cfg)
+            if hist.empty or len(hist) < 30:
+                continue
+            data = compute_indicators(hist, weekly_cfg)
+            weekly_dif_map[str(sym)] = float(data["dif"].iloc[-1])
+        except Exception:
+            continue
+
+    df = df.copy()
+    weekly_bonus_col = []
+    for _, row in df.iterrows():
+        sig = row.get("signal", "")
+        sym = str(row.get("symbol", ""))
+        bonus = 0.0
+        if sym in weekly_dif_map:
+            wdif = weekly_dif_map[sym]
+            if sig == "BUY2" and wdif > 0:
+                bonus = 5.0
+            elif sig == "SELL2" and wdif < 0:
+                bonus = 5.0
+        weekly_bonus_col.append(bonus)
+
+    df["weekly_bonus"] = weekly_bonus_col
+    if "score" in df.columns:
+        df["score"] = df["score"].astype(float) + df["weekly_bonus"]
+    df = df.drop(columns=["weekly_bonus"])
+    return df
+
+
 def format_signal_line(row: pd.Series) -> str:
     date_text = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
     signal = SIGNAL_LABELS.get(str(row["signal"]), str(row["signal"]))
@@ -349,10 +393,18 @@ def scan_from_market_db(args: argparse.Namespace) -> pd.DataFrame:
                 )
         chunks: list[pd.DataFrame] = []
 
+        # Fallback sources: akshare for daily/weekly, baostock as fallback
+        fallback_sources = ["baostock"] if source_name == "akshare" else ["akshare"]
+
         for _, row in universe.iterrows():
             symbol = str(row["symbol"])
             name = str(row.get("name", "") or "")
             hist = store.load_kline(symbol, args.period, args.adjust, source_name, start_bound, end_bound)
+            if hist.empty:
+                for fb_src in fallback_sources:
+                    hist = store.load_kline(symbol, args.period, args.adjust, fb_src, start_bound, end_bound)
+                    if not hist.empty:
+                        break
             if hist.empty:
                 continue
             signal_df = engine.scan_dataframe(hist, symbol=symbol, name=name)
@@ -444,6 +496,7 @@ def main() -> None:
             if not scan_df.empty:
                 scan_df["date"] = pd.to_datetime(scan_df["date"])
             scan_df = filter_by_date(scan_df, effective_date)
+            scan_df = apply_weekly_dif_gate(scan_df)
             archive_csv, report_json = archive_outputs(scan_df, output_path, archive_dir, report_dir, label)
 
             summary = summarise_df(scan_df)

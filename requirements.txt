@@ -1,4 +1,5 @@
 akshare
 baostock
+backtrader
 numpy
 pandas

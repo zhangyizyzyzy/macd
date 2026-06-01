@@ -79,6 +79,20 @@ class ScanConfig:
     max_B0_bars: int = 1
     max_near0_bars: int = 4
 
+    # ibuy2 / isell2 — 真·缠论二类买卖点 (L1/H1/L2 pivot 结构)
+    #   L1 = 结构低点, H1 = 反弹高点, L2 = 回调低点, 要求 L2 > L1
+    ibuy2_pivot_k: int = 3                       # pivot 窗口半径 (k=3 → 7 bars 窗口)
+    ibuy2_min_rise_bars: int = 3                 # L1→H1 最小距离
+    ibuy2_min_pullback_bars: int = 3             # H1→L2 最小距离
+    ibuy2_max_pullback_bars: int = 40            # H1→L2 最大距离
+    ibuy2_max_l1_h1_bars: int = 60               # L1→H1 最大距离
+    ibuy2_min_rise_atr: float = 1.0              # L1→H1 最小幅度 (× ATR), 过滤微震
+    ibuy2_min_pullback_atr: float = 0.5          # H1→L2 最小幅度
+    ibuy2_max_l2_retrace_ratio: float = 0.95     # L2 离 L1 的距离不能太近 (避免几乎破位)
+    ibuy2_min_l2_retrace_ratio: float = 0.25     # L2 必须真实回调 (不是微跌)
+    ibuy2_max_cross_density: float = 0.30        # 噪声过滤
+    ibuy2_vol_shrink_max: float = 1.10           # L2 段平均量 ≤ L1→H1 段平均量 × 1.10 (缩量或持平)
+
 
 UP = 1
 DOWN = -1
@@ -114,6 +128,7 @@ class SegStats:
     near0_bars: int
     below0_bars: int
     above0_bars: int
+    volume_sum: float
 
     @property
     def bars(self) -> int:
@@ -179,6 +194,7 @@ class LongCtx:
     pull2_start_idx: Optional[int] = None
     rise1_bars: Optional[int] = None
     rise1_high: Optional[float] = None
+    rise1_vol_avg: Optional[float] = None
     buy2_idx: Optional[int] = None
     zero_up_idx: Optional[int] = None
     pull3_start_idx: Optional[int] = None
@@ -198,10 +214,50 @@ class ShortCtx:
     pull2_start_idx: Optional[int] = None
     drop1_bars: Optional[int] = None
     drop1_low: Optional[float] = None
+    drop1_vol_avg: Optional[float] = None
     sell2_idx: Optional[int] = None
     zero_down_idx: Optional[int] = None
     pull3_start_idx: Optional[int] = None
     sell3_idx: Optional[int] = None
+
+
+# 真·缠论二类买卖点 (L1/H1/L2 pivot 结构)
+IBUY2_NONE = 0
+IBUY2_L1_FOUND = 1   # 已锁定 pivot low L1, 等反弹
+IBUY2_H1_FOUND = 2   # 已锁定 pivot high H1, 等回调产生 L2
+IBUY2_L2_FOUND = 3   # 已锁定 pivot low L2 (且 L2 > L1), 等止跌确认触发
+
+ISELL2_NONE = 0
+ISELL2_H1_FOUND = 1
+ISELL2_L1_FOUND = 2
+ISELL2_H2_FOUND = 3
+
+
+@dataclass(slots=True)
+class IndepBuy2Ctx:
+    state: int = IBUY2_NONE
+    l1_idx: Optional[int] = None
+    l1_price: Optional[float] = None
+    h1_idx: Optional[int] = None
+    h1_price: Optional[float] = None
+    l2_idx: Optional[int] = None
+    l2_price: Optional[float] = None
+    # Volume stats for shrinking check
+    l1_to_h1_vol_sum: float = 0.0
+    h1_to_l2_vol_sum: float = 0.0
+
+
+@dataclass(slots=True)
+class IndepSell2Ctx:
+    state: int = ISELL2_NONE
+    h1_idx: Optional[int] = None
+    h1_price: Optional[float] = None
+    l1_idx: Optional[int] = None
+    l1_price: Optional[float] = None
+    h2_idx: Optional[int] = None
+    h2_price: Optional[float] = None
+    h1_to_l1_vol_sum: float = 0.0
+    l1_to_h2_vol_sum: float = 0.0
 
 
 # ==============================
@@ -258,6 +314,7 @@ def seg_new(
     dea_: float,
     bar_: float,
     eps0: float,
+    vol_: float = 0.0,
 ) -> SegStats:
     return SegStats(
         dir=dir_,
@@ -283,6 +340,7 @@ def seg_new(
         near0_bars=1 if abs(dif_) <= eps0 and abs(dea_) <= eps0 else 0,
         below0_bars=1 if dif_ < 0 and dea_ < 0 else 0,
         above0_bars=1 if dif_ > 0 and dea_ > 0 else 0,
+        volume_sum=vol_,
     )
 
 
@@ -296,6 +354,7 @@ def seg_update(
     dea_: float,
     bar_: float,
     eps0: float,
+    vol_: float = 0.0,
 ) -> SegStats:
     seg.end_idx = i
     seg.end_close = close_
@@ -329,6 +388,7 @@ def seg_update(
         seg.below0_bars += 1
     if dif_ > 0 and dea_ > 0:
         seg.above0_bars += 1
+    seg.volume_sum += vol_
     return seg
 
 
@@ -626,6 +686,23 @@ def detect_buy2_from_closed_pullback_down(
     area_ok = closed_pull_down.area_abs <= cfg.pull2_area_ratio * max(long_ctx.buy1_main_down_area, 1e-9)
     noise = cross_density(bar, t, cfg.cross_window)
 
+    # --- 新增：价格回调比例（斐波那契） ---
+    rise1_high = long_ctx.rise1_high
+    rise_range = (rise1_high - long_ctx.buy1_low) if rise1_high is not None else 0.0
+    if rise_range > 0 and rise1_high is not None:
+        retracement = (rise1_high - closed_pull_down.low_price) / rise_range
+    else:
+        retracement = 0.0
+
+    # --- 新增：回调期间 DEA 最低位置 ---
+    pull2_dea_min = closed_pull_down.dea_min
+
+    # --- 新增：成交量萎缩比 ---
+    rise1_vol_avg = long_ctx.rise1_vol_avg or 0.0
+    pull2_bars = max(closed_pull_down.bars, 1)
+    pull2_vol_avg = closed_pull_down.volume_sum / pull2_bars
+    vol_ratio = (pull2_vol_avg / rise1_vol_avg) if rise1_vol_avg > 0 else 1.0
+
     ok = (
         not_break_buy1
         and t_rise1 >= cfg.min_rise1_bars
@@ -642,6 +719,9 @@ def detect_buy2_from_closed_pullback_down(
         "revisit_low_bars": revisit_low_bars,
         "pull2_area": closed_pull_down.area_abs,
         "cross_density": noise,
+        "retracement": round(retracement, 4),
+        "pull2_dea_min": round(pull2_dea_min, 6),
+        "vol_ratio": round(vol_ratio, 4),
     }
     return ok, feat
 
@@ -676,6 +756,23 @@ def detect_sell2_from_closed_rebound_up(
     area_ok = closed_rebound_up.area_abs <= cfg.pull2_area_ratio * max(short_ctx.sell1_main_up_area, 1e-9)
     noise = cross_density(bar, t, cfg.cross_window)
 
+    # --- 新增：价格反弹比例（斐波那契） ---
+    drop1_low = short_ctx.drop1_low
+    drop_range = (short_ctx.sell1_high - drop1_low) if drop1_low is not None else 0.0
+    if drop_range > 0 and drop1_low is not None:
+        retracement = (closed_rebound_up.high_price - drop1_low) / drop_range
+    else:
+        retracement = 0.0
+
+    # --- 新增：反弹期间 DEA 最高位置 ---
+    pull2_dea_max = closed_rebound_up.dea_max
+
+    # --- 新增：成交量萎缩比 ---
+    drop1_vol_avg = short_ctx.drop1_vol_avg or 0.0
+    pull2_bars = max(closed_rebound_up.bars, 1)
+    pull2_vol_avg = closed_rebound_up.volume_sum / pull2_bars
+    vol_ratio = (pull2_vol_avg / drop1_vol_avg) if drop1_vol_avg > 0 else 1.0
+
     ok = (
         not_break_sell1
         and t_drop1 >= cfg.min_rise1_bars
@@ -692,6 +789,9 @@ def detect_sell2_from_closed_rebound_up(
         "revisit_high_bars": revisit_high_bars,
         "pull2_area": closed_rebound_up.area_abs,
         "cross_density": noise,
+        "retracement": round(retracement, 4),
+        "pull2_dea_max": round(pull2_dea_max, 6),
+        "vol_ratio": round(vol_ratio, 4),
     }
     return ok, feat
 
@@ -774,6 +874,274 @@ def detect_sell3_from_closed_rebound_up(
     return ok, feat
 
 
+# --------------------------------------------------
+# IBUY2 / ISELL2 — 真·缠论二类买卖点 (L1/H1/L2 pivot 结构)
+# --------------------------------------------------
+
+
+def is_pivot_low(low: np.ndarray, t: int, k: int) -> bool:
+    """t 位置是不是以 k 为半径的 pivot low (严格低于左右 k 根)."""
+    if t < k or t >= len(low) - k:
+        return False
+    center = low[t]
+    for i in range(1, k + 1):
+        if low[t - i] < center or low[t + i] < center:
+            return False
+        # Strictly lower requirement: at least one neighbor must be higher
+    has_higher = False
+    for i in range(1, k + 1):
+        if low[t - i] > center or low[t + i] > center:
+            has_higher = True
+            break
+    return has_higher
+
+
+def is_pivot_high(high: np.ndarray, t: int, k: int) -> bool:
+    if t < k or t >= len(high) - k:
+        return False
+    center = high[t]
+    for i in range(1, k + 1):
+        if high[t - i] > center or high[t + i] > center:
+            return False
+    has_lower = False
+    for i in range(1, k + 1):
+        if high[t - i] < center or high[t + i] < center:
+            has_lower = True
+            break
+    return has_lower
+
+
+def detect_ibuy2_chan(
+    t: int,
+    ibuy2_ctx: IndepBuy2Ctx,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    bar: np.ndarray,
+    atr: np.ndarray,
+    cfg: ScanConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """缠论二类买点触发检测.
+
+    前提: ibuy2_ctx 处于 L2_FOUND 状态 (L1/H1/L2 三点结构已成立).
+    触发: 当前 bar close 高于 L2 的 close (第一次止跌反弹确认).
+
+    说明:
+    - L2 已经是一个 pivot low, 意味着它左右 k 根之内都更高
+    - 这里我们还要求一次 "收盘价确认": close[t] > close[l2_idx]
+    - 这避免 L2 后还没真正企稳就触发
+    """
+    if ibuy2_ctx.state != IBUY2_L2_FOUND:
+        return False, {}
+    if ibuy2_ctx.l1_idx is None or ibuy2_ctx.h1_idx is None or ibuy2_ctx.l2_idx is None:
+        return False, {}
+    if ibuy2_ctx.l1_price is None or ibuy2_ctx.h1_price is None or ibuy2_ctx.l2_price is None:
+        return False, {}
+
+    l1_idx, l2_idx, h1_idx = ibuy2_ctx.l1_idx, ibuy2_ctx.l2_idx, ibuy2_ctx.h1_idx
+
+    # Must be a bar strictly after L2
+    if t <= l2_idx:
+        return False, {}
+
+    # Break-down guard: 若从 L2 至今出现跌破 L1 的 bar, 整个结构作废 (调用方会重置)
+    min_low_since_l2 = float(np.min(low[l2_idx : t + 1]))
+    if min_low_since_l2 < ibuy2_ctx.l1_price - cfg.eps_price_atr * atr[t]:
+        return False, {}
+
+    # 止跌确认: 当前 close > L2 bar 的 close (第一根收阳/抬升)
+    close_confirmation = close[t] > close[l2_idx]
+    if not close_confirmation:
+        return False, {}
+
+    # Additional sanity checks (these should already be enforced by state machine but double-check)
+    rise_atr = (ibuy2_ctx.h1_price - ibuy2_ctx.l1_price) / atr[t] if atr[t] > 0 else 0.0
+    pull_atr = (ibuy2_ctx.h1_price - ibuy2_ctx.l2_price) / atr[t] if atr[t] > 0 else 0.0
+    rise_bars = h1_idx - l1_idx
+    pull_bars = l2_idx - h1_idx
+
+    cond_rise_atr = rise_atr >= cfg.ibuy2_min_rise_atr
+    cond_pull_atr = pull_atr >= cfg.ibuy2_min_pullback_atr
+    cond_rise_bars = rise_bars >= cfg.ibuy2_min_rise_bars
+    cond_pull_bars_min = pull_bars >= cfg.ibuy2_min_pullback_bars
+    cond_pull_bars_max = pull_bars <= cfg.ibuy2_max_pullback_bars
+    cond_l2_above_l1 = ibuy2_ctx.l2_price > ibuy2_ctx.l1_price
+    # Retrace ratio of L2: how much of the L1→H1 rise was retraced by L2
+    rise_range = ibuy2_ctx.h1_price - ibuy2_ctx.l1_price
+    if rise_range > 0:
+        l2_retrace = (ibuy2_ctx.h1_price - ibuy2_ctx.l2_price) / rise_range
+    else:
+        l2_retrace = 0.0
+    cond_retrace_min = l2_retrace >= cfg.ibuy2_min_l2_retrace_ratio
+    cond_retrace_max = l2_retrace <= cfg.ibuy2_max_l2_retrace_ratio
+
+    # Volume shrink check: L2 段均量 ≤ L1→H1 段均量 × max
+    rise_vol = float(np.mean(volume[l1_idx : h1_idx + 1])) if h1_idx > l1_idx else 0.0
+    pull_vol = float(np.mean(volume[h1_idx : l2_idx + 1])) if l2_idx > h1_idx else 0.0
+    vol_ratio = (pull_vol / rise_vol) if rise_vol > 0 else 1.0
+    cond_vol_ok = vol_ratio <= cfg.ibuy2_vol_shrink_max
+
+    noise = cross_density(bar, t, cfg.cross_window)
+    cond_noise = noise <= cfg.ibuy2_max_cross_density
+
+    ok = (
+        cond_rise_atr
+        and cond_pull_atr
+        and cond_rise_bars
+        and cond_pull_bars_min
+        and cond_pull_bars_max
+        and cond_l2_above_l1
+        and cond_retrace_min
+        and cond_retrace_max
+        and cond_vol_ok
+        and cond_noise
+    )
+
+    feat = {
+        "l1_idx": l1_idx,
+        "l1_price": round(float(ibuy2_ctx.l1_price), 4),
+        "h1_idx": h1_idx,
+        "h1_price": round(float(ibuy2_ctx.h1_price), 4),
+        "l2_idx": l2_idx,
+        "l2_price": round(float(ibuy2_ctx.l2_price), 4),
+        "rise_atr": round(rise_atr, 4),
+        "pull_atr": round(pull_atr, 4),
+        "rise_bars": rise_bars,
+        "pull_bars": pull_bars,
+        "l2_retrace": round(l2_retrace, 4),
+        "vol_ratio": round(vol_ratio, 4),
+        "cross_density": round(noise, 4),
+        "l2_above_l1_atr": round((ibuy2_ctx.l2_price - ibuy2_ctx.l1_price) / atr[t] if atr[t] > 0 else 0, 4),
+    }
+    return ok, feat
+
+
+def detect_isell2_chan(
+    t: int,
+    isell2_ctx: IndepSell2Ctx,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    bar: np.ndarray,
+    atr: np.ndarray,
+    cfg: ScanConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """缠论二类卖点 — H1/L1/H2 三点结构, H2 < H1."""
+    if isell2_ctx.state != ISELL2_H2_FOUND:
+        return False, {}
+    if isell2_ctx.h1_idx is None or isell2_ctx.l1_idx is None or isell2_ctx.h2_idx is None:
+        return False, {}
+    if isell2_ctx.h1_price is None or isell2_ctx.l1_price is None or isell2_ctx.h2_price is None:
+        return False, {}
+
+    h1_idx, l1_idx, h2_idx = isell2_ctx.h1_idx, isell2_ctx.l1_idx, isell2_ctx.h2_idx
+
+    if t <= h2_idx:
+        return False, {}
+
+    # Break-up guard
+    max_high_since_h2 = float(np.max(high[h2_idx : t + 1]))
+    if max_high_since_h2 > isell2_ctx.h1_price + cfg.eps_price_atr * atr[t]:
+        return False, {}
+
+    close_confirmation = close[t] < close[h2_idx]
+    if not close_confirmation:
+        return False, {}
+
+    drop_atr = (isell2_ctx.h1_price - isell2_ctx.l1_price) / atr[t] if atr[t] > 0 else 0.0
+    rebound_atr = (isell2_ctx.h2_price - isell2_ctx.l1_price) / atr[t] if atr[t] > 0 else 0.0
+    drop_bars = l1_idx - h1_idx
+    rebound_bars = h2_idx - l1_idx
+
+    cond_drop_atr = drop_atr >= cfg.ibuy2_min_rise_atr
+    cond_rebound_atr = rebound_atr >= cfg.ibuy2_min_pullback_atr
+    cond_drop_bars = drop_bars >= cfg.ibuy2_min_rise_bars
+    cond_rebound_bars_min = rebound_bars >= cfg.ibuy2_min_pullback_bars
+    cond_rebound_bars_max = rebound_bars <= cfg.ibuy2_max_pullback_bars
+    cond_h2_below_h1 = isell2_ctx.h2_price < isell2_ctx.h1_price
+    drop_range = isell2_ctx.h1_price - isell2_ctx.l1_price
+    if drop_range > 0:
+        h2_retrace = (isell2_ctx.h2_price - isell2_ctx.l1_price) / drop_range
+    else:
+        h2_retrace = 0.0
+    cond_retrace_min = h2_retrace >= cfg.ibuy2_min_l2_retrace_ratio
+    cond_retrace_max = h2_retrace <= cfg.ibuy2_max_l2_retrace_ratio
+
+    drop_vol = float(np.mean(volume[h1_idx : l1_idx + 1])) if l1_idx > h1_idx else 0.0
+    rebound_vol = float(np.mean(volume[l1_idx : h2_idx + 1])) if h2_idx > l1_idx else 0.0
+    vol_ratio = (rebound_vol / drop_vol) if drop_vol > 0 else 1.0
+    cond_vol_ok = vol_ratio <= cfg.ibuy2_vol_shrink_max
+
+    noise = cross_density(bar, t, cfg.cross_window)
+    cond_noise = noise <= cfg.ibuy2_max_cross_density
+
+    ok = (
+        cond_drop_atr
+        and cond_rebound_atr
+        and cond_drop_bars
+        and cond_rebound_bars_min
+        and cond_rebound_bars_max
+        and cond_h2_below_h1
+        and cond_retrace_min
+        and cond_retrace_max
+        and cond_vol_ok
+        and cond_noise
+    )
+
+    feat = {
+        "h1_idx": h1_idx,
+        "h1_price": round(float(isell2_ctx.h1_price), 4),
+        "l1_idx": l1_idx,
+        "l1_price": round(float(isell2_ctx.l1_price), 4),
+        "h2_idx": h2_idx,
+        "h2_price": round(float(isell2_ctx.h2_price), 4),
+        "drop_atr": round(drop_atr, 4),
+        "rebound_atr": round(rebound_atr, 4),
+        "drop_bars": drop_bars,
+        "rebound_bars": rebound_bars,
+        "h2_retrace": round(h2_retrace, 4),
+        "vol_ratio": round(vol_ratio, 4),
+        "cross_density": round(noise, 4),
+    }
+    return ok, feat
+
+
+# Kept for backward compatibility with scan_dataframe wiring
+# (thin wrappers so main loop doesn't need to change much)
+
+
+def detect_ibuy2_from_closed_pullback_down(
+    t: int,
+    closed_pull_down: Optional[SegStats],
+    ibuy2_ctx: IndepBuy2Ctx,
+    low: np.ndarray,
+    dif: np.ndarray,
+    dea: np.ndarray,
+    bar: np.ndarray,
+    atr: np.ndarray,
+    cfg: ScanConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """DEPRECATED wrapper — always returns False. Real detection happens in main loop."""
+    return False, {}
+
+
+def detect_isell2_from_closed_rebound_up(
+    t: int,
+    closed_rebound_up: Optional[SegStats],
+    isell2_ctx: IndepSell2Ctx,
+    high: np.ndarray,
+    dif: np.ndarray,
+    dea: np.ndarray,
+    bar: np.ndarray,
+    atr: np.ndarray,
+    cfg: ScanConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """DEPRECATED wrapper — always returns False. Real detection happens in main loop."""
+    return False, {}
+
+
 def reset_long() -> LongCtx:
     return LongCtx()
 
@@ -828,7 +1196,7 @@ def on_sell1(short_ctx: ShortCtx, t: int, price: float, feat: dict[str, Any]) ->
     short_ctx.sell3_idx = None
 
 
-def on_first_cross_down_after_buy1(long_ctx: LongCtx, t: int, high: np.ndarray) -> None:
+def on_first_cross_down_after_buy1(long_ctx: LongCtx, t: int, high: np.ndarray, volume: np.ndarray) -> None:
     if long_ctx.buy1_idx is None:
         return
     if long_ctx.zero_up_idx is None:
@@ -836,9 +1204,13 @@ def on_first_cross_down_after_buy1(long_ctx: LongCtx, t: int, high: np.ndarray) 
         long_ctx.pull2_start_idx = t
         long_ctx.rise1_bars = t - long_ctx.buy1_idx
         long_ctx.rise1_high = float(np.max(high[long_ctx.buy1_idx:t])) if t > long_ctx.buy1_idx else None
+        if t > long_ctx.buy1_idx:
+            long_ctx.rise1_vol_avg = float(np.mean(volume[long_ctx.buy1_idx:t]))
+        else:
+            long_ctx.rise1_vol_avg = 0.0
 
 
-def on_first_cross_up_after_sell1(short_ctx: ShortCtx, t: int, low: np.ndarray) -> None:
+def on_first_cross_up_after_sell1(short_ctx: ShortCtx, t: int, low: np.ndarray, volume: np.ndarray) -> None:
     if short_ctx.sell1_idx is None:
         return
     if short_ctx.zero_down_idx is None:
@@ -846,6 +1218,10 @@ def on_first_cross_up_after_sell1(short_ctx: ShortCtx, t: int, low: np.ndarray) 
         short_ctx.pull2_start_idx = t
         short_ctx.drop1_bars = t - short_ctx.sell1_idx
         short_ctx.drop1_low = float(np.min(low[short_ctx.sell1_idx:t])) if t > short_ctx.sell1_idx else None
+        if t > short_ctx.sell1_idx:
+            short_ctx.drop1_vol_avg = float(np.mean(volume[short_ctx.sell1_idx:t]))
+        else:
+            short_ctx.drop1_vol_avg = 0.0
 
 
 def on_buy2(long_ctx: LongCtx, t: int) -> None:
@@ -892,6 +1268,34 @@ def on_sell3(short_ctx: ShortCtx, t: int) -> None:
     short_ctx.sell3_idx = t
 
 
+# --- Chan L1/H1/L2 helpers ---
+
+
+def on_ibuy2_done(ctx: IndepBuy2Ctx) -> None:
+    """Fire完成后彻底重置."""
+    ctx.state = IBUY2_NONE
+    ctx.l1_idx = None
+    ctx.l1_price = None
+    ctx.h1_idx = None
+    ctx.h1_price = None
+    ctx.l2_idx = None
+    ctx.l2_price = None
+    ctx.l1_to_h1_vol_sum = 0.0
+    ctx.h1_to_l2_vol_sum = 0.0
+
+
+def on_isell2_done(ctx: IndepSell2Ctx) -> None:
+    ctx.state = ISELL2_NONE
+    ctx.h1_idx = None
+    ctx.h1_price = None
+    ctx.l1_idx = None
+    ctx.l1_price = None
+    ctx.h2_idx = None
+    ctx.h2_price = None
+    ctx.h1_to_l1_vol_sum = 0.0
+    ctx.l1_to_h2_vol_sum = 0.0
+
+
 def simple_signal_score(signal_type: str, feat: dict[str, Any], cfg: ScanConfig) -> float:
     del cfg
     score = 50.0
@@ -908,11 +1312,47 @@ def simple_signal_score(signal_type: str, feat: dict[str, Any], cfg: ScanConfig)
         score += max(0, 10 - 10 * float(feat.get("R_2", 10)))
         score += max(0, 6 - float(feat.get("revisit_low_bars", feat.get("revisit_high_bars", 6))))
         score -= 10 * float(feat.get("cross_density", 0))
+        # 斐波那契回调加分：回调越浅分越高，0.382 以内最多加 8 分
+        retrace = float(feat.get("retracement", 1.0))
+        score += max(0.0, 8.0 * (0.618 - retrace))
+        # DEA 位置加分：BUY2 回调期间 DEA 未跌破零加 5 分，SELL2 反弹期间 DEA 未升破零加 5 分
+        if signal_type == "BUY2":
+            if float(feat.get("pull2_dea_min", -1)) >= 0:
+                score += 5
+        else:
+            if float(feat.get("pull2_dea_max", 1)) <= 0:
+                score += 5
+        # 成交量萎缩加分：回调/反弹量比上涨/下跌量低于 0.75 则加 5 分
+        vol_r = float(feat.get("vol_ratio", 1.0))
+        if vol_r < 0.75:
+            score += 5
     elif signal_type in {"BUY3", "SELL3"}:
         score += max(0, 6 - float(feat.get("T_pull3", 6)))
         score += max(0, 3 - float(feat.get("B0", feat.get("A0", 3))))
         score += max(0, 4 - float(feat.get("T_near0", 4)))
         score -= 12 * float(feat.get("cross_density", 0))
+    elif signal_type in {"IBUY2", "ISELL2"}:
+        # 缩量加分 (up to 10 pts)
+        vol_r = float(feat.get("vol_ratio", 1.0))
+        score += max(0.0, 10.0 * (1.0 - vol_r))
+        # L2 回撤比 — 黄金分割 0.382-0.618 区间给最高分
+        retrace = float(feat.get("l2_retrace", feat.get("h2_retrace", 0.0)))
+        if 0.382 <= retrace <= 0.618:
+            score += 10.0
+        elif 0.300 <= retrace < 0.382:
+            score += 6.0
+        elif 0.618 < retrace <= 0.750:
+            score += 4.0
+        elif 0.250 <= retrace < 0.300 or 0.750 < retrace <= 0.850:
+            score += 2.0
+        # 反弹/下跌幅度加分 (越大越确认结构, up to 8 pts)
+        rise_atr = float(feat.get("rise_atr", feat.get("drop_atr", 0.0)))
+        score += min(8.0, rise_atr * 2)
+        # L2 高于 L1 的幅度 (up to 5 pts)
+        l2_above = float(feat.get("l2_above_l1_atr", 0.0))
+        score += min(5.0, max(0.0, l2_above * 2))
+        # 噪声惩罚
+        score -= 10 * float(feat.get("cross_density", 0))
     return round(float(score), 4)
 
 
@@ -944,6 +1384,7 @@ class MACDTimeSignalEngine:
         dea = data["dea"].to_numpy(dtype=float)
         bar = data["bar"].to_numpy(dtype=float)
         atr = data["atr"].to_numpy(dtype=float)
+        volume = data["volume"].to_numpy(dtype=float) if "volume" in data.columns else np.zeros(len(data))
 
         start = 2
         init_dir = UP if bar[start] >= 0 else DOWN
@@ -957,12 +1398,15 @@ class MACDTimeSignalEngine:
             dea[start],
             bar[start],
             self.cfg.eps_zero_atr * atr[start],
+            volume[start],
         )
 
         last_closed_down: Optional[SegStats] = None
         last_closed_up: Optional[SegStats] = None
         long_ctx = reset_long()
         short_ctx = reset_short()
+        ibuy2_ctx = IndepBuy2Ctx()
+        isell2_ctx = IndepSell2Ctx()
         signals: list[dict[str, Any]] = []
 
         for t in range(start + 1, len(data)):
@@ -971,7 +1415,7 @@ class MACDTimeSignalEngine:
             cd = cross_down(bar, t)
 
             if not cu and not cd:
-                current_seg = seg_update(current_seg, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0)
+                current_seg = seg_update(current_seg, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0, volume[t])
 
                 if current_seg.dir == DOWN and last_closed_down is not None:
                     ok_lb, feat_lb = detect_left_bottom_live(
@@ -1015,7 +1459,7 @@ class MACDTimeSignalEngine:
                     signals.append(self._make_signal_row(dt[t], symbol, name, close[t], "BUY1", feat_b1))
 
                 last_closed_down = closed_down
-                current_seg = seg_new(UP, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0)
+                current_seg = seg_new(UP, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0, volume[t])
 
             else:
                 closed_up = dataclasses.replace(current_seg)
@@ -1043,7 +1487,7 @@ class MACDTimeSignalEngine:
                     signals.append(self._make_signal_row(dt[t], symbol, name, close[t], "SELL1", feat_s1))
 
                 last_closed_up = closed_up
-                current_seg = seg_new(DOWN, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0)
+                current_seg = seg_new(DOWN, t, high[t], low[t], close[t], dif[t], dea[t], bar[t], eps0, volume[t])
 
             if long_ctx.buy1_idx is not None and long_ctx.zero_up_idx is None and dual_above_zero(dif, dea, t):
                 on_zero_up(long_ctx, t)
@@ -1051,9 +1495,9 @@ class MACDTimeSignalEngine:
                 on_zero_down(short_ctx, t)
 
             if cd and long_ctx.buy1_idx is not None and long_ctx.zero_up_idx is None:
-                on_first_cross_down_after_buy1(long_ctx, t, high)
+                on_first_cross_down_after_buy1(long_ctx, t, high, volume)
             if cu and short_ctx.sell1_idx is not None and short_ctx.zero_down_idx is None:
-                on_first_cross_up_after_sell1(short_ctx, t, low)
+                on_first_cross_up_after_sell1(short_ctx, t, low, volume)
             if cd and long_ctx.zero_up_idx is not None:
                 on_first_cross_down_after_zero_up(long_ctx, t)
             if cu and short_ctx.zero_down_idx is not None:
@@ -1063,6 +1507,152 @@ class MACDTimeSignalEngine:
                 long_ctx = reset_long()
             if short_ctx.sell1_high is not None and high[t] > short_ctx.sell1_high + self.cfg.eps_price_atr * atr[t]:
                 short_ctx = reset_short()
+
+            # ---- 缠论二类买卖点 pivot state machine ----
+            # Pivot @ t-k can only be confirmed at time t (needs k bars of forward context).
+            k = self.cfg.ibuy2_pivot_k
+            pivot_t = t - k  # index being evaluated as a pivot
+            if pivot_t >= k:
+                is_pl = is_pivot_low(low, pivot_t, k)
+                is_ph = is_pivot_high(high, pivot_t, k)
+
+                # IBUY2 long side state machine
+                if is_pl:
+                    if ibuy2_ctx.state == IBUY2_NONE:
+                        # Found L1
+                        ibuy2_ctx.state = IBUY2_L1_FOUND
+                        ibuy2_ctx.l1_idx = pivot_t
+                        ibuy2_ctx.l1_price = float(low[pivot_t])
+                    elif ibuy2_ctx.state == IBUY2_L1_FOUND:
+                        # Another low before H1 — update L1 if lower
+                        if ibuy2_ctx.l1_price is None or low[pivot_t] < ibuy2_ctx.l1_price:
+                            ibuy2_ctx.l1_idx = pivot_t
+                            ibuy2_ctx.l1_price = float(low[pivot_t])
+                    elif ibuy2_ctx.state == IBUY2_H1_FOUND:
+                        # Potential L2 found
+                        assert ibuy2_ctx.l1_price is not None
+                        assert ibuy2_ctx.h1_idx is not None
+                        l2_price = float(low[pivot_t])
+                        if l2_price > ibuy2_ctx.l1_price:
+                            # Valid L2: higher than L1
+                            ibuy2_ctx.state = IBUY2_L2_FOUND
+                            ibuy2_ctx.l2_idx = pivot_t
+                            ibuy2_ctx.l2_price = l2_price
+                        else:
+                            # Broke below L1: treat as new L1, drop H1
+                            ibuy2_ctx.state = IBUY2_L1_FOUND
+                            ibuy2_ctx.l1_idx = pivot_t
+                            ibuy2_ctx.l1_price = l2_price
+                            ibuy2_ctx.h1_idx = None
+                            ibuy2_ctx.h1_price = None
+                    elif ibuy2_ctx.state == IBUY2_L2_FOUND:
+                        # Another low after L2 — if lower, L2 failed
+                        assert ibuy2_ctx.l2_price is not None
+                        if low[pivot_t] < ibuy2_ctx.l2_price:
+                            if ibuy2_ctx.l1_price is not None and low[pivot_t] > ibuy2_ctx.l1_price:
+                                # New L2 candidate
+                                ibuy2_ctx.l2_idx = pivot_t
+                                ibuy2_ctx.l2_price = float(low[pivot_t])
+                            else:
+                                # Broke L1, restart
+                                on_ibuy2_done(ibuy2_ctx)
+                                ibuy2_ctx.state = IBUY2_L1_FOUND
+                                ibuy2_ctx.l1_idx = pivot_t
+                                ibuy2_ctx.l1_price = float(low[pivot_t])
+
+                if is_ph:
+                    if ibuy2_ctx.state == IBUY2_L1_FOUND:
+                        assert ibuy2_ctx.l1_idx is not None
+                        rise_bars = pivot_t - ibuy2_ctx.l1_idx
+                        if rise_bars >= self.cfg.ibuy2_min_rise_bars and rise_bars <= self.cfg.ibuy2_max_l1_h1_bars:
+                            ibuy2_ctx.state = IBUY2_H1_FOUND
+                            ibuy2_ctx.h1_idx = pivot_t
+                            ibuy2_ctx.h1_price = float(high[pivot_t])
+                    elif ibuy2_ctx.state == IBUY2_H1_FOUND:
+                        # Higher H1 supersedes
+                        if ibuy2_ctx.h1_price is not None and high[pivot_t] > ibuy2_ctx.h1_price:
+                            ibuy2_ctx.h1_idx = pivot_t
+                            ibuy2_ctx.h1_price = float(high[pivot_t])
+
+                # ISELL2 short side (symmetric)
+                if is_ph:
+                    if isell2_ctx.state == ISELL2_NONE:
+                        isell2_ctx.state = ISELL2_H1_FOUND
+                        isell2_ctx.h1_idx = pivot_t
+                        isell2_ctx.h1_price = float(high[pivot_t])
+                    elif isell2_ctx.state == ISELL2_H1_FOUND:
+                        if isell2_ctx.h1_price is None or high[pivot_t] > isell2_ctx.h1_price:
+                            isell2_ctx.h1_idx = pivot_t
+                            isell2_ctx.h1_price = float(high[pivot_t])
+                    elif isell2_ctx.state == ISELL2_L1_FOUND:
+                        assert isell2_ctx.h1_price is not None
+                        assert isell2_ctx.l1_idx is not None
+                        h2_price = float(high[pivot_t])
+                        if h2_price < isell2_ctx.h1_price:
+                            isell2_ctx.state = ISELL2_H2_FOUND
+                            isell2_ctx.h2_idx = pivot_t
+                            isell2_ctx.h2_price = h2_price
+                        else:
+                            isell2_ctx.state = ISELL2_H1_FOUND
+                            isell2_ctx.h1_idx = pivot_t
+                            isell2_ctx.h1_price = h2_price
+                            isell2_ctx.l1_idx = None
+                            isell2_ctx.l1_price = None
+                    elif isell2_ctx.state == ISELL2_H2_FOUND:
+                        assert isell2_ctx.h2_price is not None
+                        if high[pivot_t] > isell2_ctx.h2_price:
+                            if isell2_ctx.h1_price is not None and high[pivot_t] < isell2_ctx.h1_price:
+                                isell2_ctx.h2_idx = pivot_t
+                                isell2_ctx.h2_price = float(high[pivot_t])
+                            else:
+                                on_isell2_done(isell2_ctx)
+                                isell2_ctx.state = ISELL2_H1_FOUND
+                                isell2_ctx.h1_idx = pivot_t
+                                isell2_ctx.h1_price = float(high[pivot_t])
+
+                if is_pl:
+                    if isell2_ctx.state == ISELL2_H1_FOUND:
+                        assert isell2_ctx.h1_idx is not None
+                        drop_bars = pivot_t - isell2_ctx.h1_idx
+                        if drop_bars >= self.cfg.ibuy2_min_rise_bars and drop_bars <= self.cfg.ibuy2_max_l1_h1_bars:
+                            isell2_ctx.state = ISELL2_L1_FOUND
+                            isell2_ctx.l1_idx = pivot_t
+                            isell2_ctx.l1_price = float(low[pivot_t])
+                    elif isell2_ctx.state == ISELL2_L1_FOUND:
+                        if isell2_ctx.l1_price is not None and low[pivot_t] < isell2_ctx.l1_price:
+                            isell2_ctx.l1_idx = pivot_t
+                            isell2_ctx.l1_price = float(low[pivot_t])
+
+            # Check fire condition at current bar t (not pivot_t)
+            if ibuy2_ctx.state == IBUY2_L2_FOUND:
+                # If pullback section too long, give up
+                if ibuy2_ctx.l2_idx is not None and (t - ibuy2_ctx.l2_idx) > self.cfg.ibuy2_max_pullback_bars:
+                    on_ibuy2_done(ibuy2_ctx)
+                else:
+                    # Hard break-below: if current low < L1 anchor, reset
+                    if ibuy2_ctx.l1_price is not None and low[t] < ibuy2_ctx.l1_price - self.cfg.eps_price_atr * atr[t]:
+                        on_ibuy2_done(ibuy2_ctx)
+                    else:
+                        ok_ib2, feat_ib2 = detect_ibuy2_chan(
+                            t, ibuy2_ctx, high, low, close, volume, bar, atr, self.cfg
+                        )
+                        if ok_ib2:
+                            signals.append(self._make_signal_row(dt[t], symbol, name, close[t], "IBUY2", feat_ib2))
+                            on_ibuy2_done(ibuy2_ctx)
+
+            if isell2_ctx.state == ISELL2_H2_FOUND:
+                if isell2_ctx.h2_idx is not None and (t - isell2_ctx.h2_idx) > self.cfg.ibuy2_max_pullback_bars:
+                    on_isell2_done(isell2_ctx)
+                else:
+                    if isell2_ctx.h1_price is not None and high[t] > isell2_ctx.h1_price + self.cfg.eps_price_atr * atr[t]:
+                        on_isell2_done(isell2_ctx)
+                    else:
+                        ok_is2, feat_is2 = detect_isell2_chan(
+                            t, isell2_ctx, high, low, close, volume, bar, atr, self.cfg
+                        )
+                        if ok_is2:
+                            signals.append(self._make_signal_row(dt[t], symbol, name, close[t], "ISELL2", feat_is2))
+                            on_isell2_done(isell2_ctx)
 
         sig_df = pd.DataFrame(signals)
         if sig_df.empty:
@@ -1153,16 +1743,71 @@ class AKShareProvider:
         return spot
 
     def get_history(self, symbol: str, cfg: ScanConfig) -> pd.DataFrame:
-        df = self.ak.stock_zh_a_hist(
-            symbol=symbol,
-            period=cfg.period,
-            start_date=cfg.start_date,
-            end_date=cfg.end_date,
-            adjust=cfg.adjust,
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        return normalize_akshare_history(df)
+        try:
+            df = self.ak.stock_zh_a_hist(
+                symbol=symbol,
+                period=cfg.period,
+                start_date=cfg.start_date,
+                end_date=cfg.end_date,
+                adjust=cfg.adjust,
+            )
+            if df is None or df.empty:
+                return pd.DataFrame()
+            return normalize_akshare_history(df)
+        except Exception:
+            return _baostock_daily_history(symbol, cfg)
+
+
+_BAO_SESSION_READY = False
+
+
+def _ensure_baostock_session() -> Any:
+    global _BAO_SESSION_READY
+    import atexit
+    import baostock as bs
+
+    if not _BAO_SESSION_READY:
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError(f"baostock login failed: {login.error_msg}")
+        _BAO_SESSION_READY = True
+        atexit.register(lambda: bs.logout())
+    return bs
+
+
+def _baostock_daily_history(symbol: str, cfg: ScanConfig) -> pd.DataFrame:
+    """Fallback: fetch daily/weekly/monthly data via baostock when AKShare fails."""
+    bs = _ensure_baostock_session()
+
+    freq_map = {"daily": "d", "weekly": "w", "monthly": "m"}
+    frequency = freq_map.get(cfg.period, "d")
+    adjustflag = {"": "3", "qfq": "2", "hfq": "1"}.get(cfg.adjust or "", "3")
+    bao_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5")) else f"sz.{symbol}"
+
+    start = pd.Timestamp(cfg.start_date).strftime("%Y-%m-%d")
+    end = pd.Timestamp(cfg.end_date).strftime("%Y-%m-%d")
+
+    rs = bs.query_history_k_data_plus(
+        bao_code,
+        "date,open,high,low,close,volume,amount,turn",
+        start_date=start,
+        end_date=end,
+        frequency=frequency,
+        adjustflag=adjustflag,
+    )
+    rows: list[list[str]] = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=rs.fields)
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"])
+    df["turnover"] = pd.to_numeric(df["turn"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+    return df[["date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 
 # ==============================

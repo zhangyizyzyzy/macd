@@ -1,0 +1,260 @@
+//@version=6
+// ============================================================
+// IBUY2 v3 — 真·缠论二类买点 (Chanlun 2nd Buy Point)
+//
+// 核心逻辑: L1 → H1 → L2, 其中 L2 > L1 (不创新低 = 底部二次确认)
+//
+//   pivot_low L1   ──反弹──▶   pivot_high H1   ──回调──▶   pivot_low L2
+//                                                                │
+//                                              L2 > L1 ? ─── yes ─▶ 等止跌确认
+//                                                                         │
+//                                                            close[t] > close[L2] ─▶ FIRE IBUY2
+//
+// 状态:
+//   NONE       → 等待第一个 pivot low (L1)
+//   L1_FOUND   → 等待 pivot high (H1)
+//   H1_FOUND   → 等待下一个 pivot low (L2), 必须 > L1
+//   L2_FOUND   → 等止跌确认 (close > L2 的 close), 若破 L1 则重置
+//
+// 重要:
+//   - 不再关心 0 轴 / 冲锋 / 金叉
+//   - 触发点在 L2 之后的第一个反弹 bar
+//   - 买点在底部, 不在冲锋顶部
+// ============================================================
+strategy("IBUY2 v3 - Chanlun 2nd Buy", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.025, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ============= Inputs =============
+grp_pivot = "Pivot 结构"
+pivot_k             = input.int(3,   "Pivot 半径 k",                group=grp_pivot)
+min_rise_bars       = input.int(3,   "L1→H1 最小距离",              group=grp_pivot)
+max_l1_h1_bars      = input.int(60,  "L1→H1 最大距离",              group=grp_pivot)
+min_pullback_bars   = input.int(3,   "H1→L2 最小距离",              group=grp_pivot)
+max_pullback_bars   = input.int(40,  "H1→L2 最大距离",              group=grp_pivot)
+
+grp_mag = "幅度约束"
+min_rise_atr        = input.float(1.0, "L1→H1 最小幅度 (× ATR)", step=0.1, group=grp_mag)
+min_pullback_atr    = input.float(0.5, "H1→L2 最小幅度 (× ATR)", step=0.1, group=grp_mag)
+min_l2_retrace      = input.float(0.25, "L2 最小回撤比例",          step=0.05, group=grp_mag)
+max_l2_retrace      = input.float(0.95, "L2 最大回撤比例",          step=0.05, group=grp_mag)
+
+grp_other = "其他"
+atr_len             = input.int(14,   "ATR 周期",                  group=grp_other)
+eps_price_atr       = input.float(0.2, "L1 容差 (× ATR)",      step=0.1, group=grp_other)
+vol_shrink_max      = input.float(1.10, "L2 段量 / L1→H1 段量 最大比", step=0.05, group=grp_other)
+
+grp_exit = "出场规则"
+use_atr_stop        = input.bool(true,  "ATR 固定止损",            group=grp_exit)
+atr_stop_mult       = input.float(2.0, "ATR 止损倍数", step=0.5, group=grp_exit)
+use_target          = input.bool(true, "ATR 目标止盈",             group=grp_exit)
+target_atr_mult     = input.float(4.0, "ATR 目标倍数", step=0.5, group=grp_exit)
+use_time_stop       = input.bool(false, "最长持仓限制",             group=grp_exit)
+max_hold_bars       = input.int(60,    "最长持仓 bars",            group=grp_exit)
+
+grp_viz = "可视化"
+show_points = input.bool(true, "标注 L1 / H1 / L2",              group=grp_viz)
+show_state  = input.bool(true, "高亮各状态背景",                   group=grp_viz)
+
+// ============= Indicators =============
+atr = ta.atr(atr_len)
+
+// Pine v6 pivot helpers — call every bar
+ph_val = ta.pivothigh(high, pivot_k, pivot_k)
+pl_val = ta.pivotlow(low,  pivot_k, pivot_k)
+
+// Pivot was confirmed k bars ago (delay)
+is_new_ph = not na(ph_val)
+is_new_pl = not na(pl_val)
+
+// ============= State vars =============
+// state: 0=NONE, 1=L1_FOUND, 2=H1_FOUND, 3=L2_FOUND
+var int   state       = 0
+var int   l1_idx      = na
+var float l1_price    = na
+var int   h1_idx      = na
+var float h1_price    = na
+var int   l2_idx      = na
+var float l2_price    = na
+var float l2_close    = na
+
+fire_signal = false
+
+// Position of the newly confirmed pivot (k bars behind current bar)
+pivot_bar = bar_index - pivot_k
+
+// ============= State transitions =============
+// --- pivot low arrived ---
+if is_new_pl
+    px = pl_val
+    if state == 0
+        state    := 1
+        l1_idx   := pivot_bar
+        l1_price := px
+    else if state == 1
+        if px < l1_price
+            l1_idx   := pivot_bar
+            l1_price := px
+    else if state == 2
+        if px > l1_price
+            state    := 3
+            l2_idx   := pivot_bar
+            l2_price := px
+            l2_close := close[pivot_k]
+        else
+            // broke below L1 → treat as new L1
+            state    := 1
+            l1_idx   := pivot_bar
+            l1_price := px
+            h1_idx   := na
+            h1_price := na
+    else if state == 3
+        if px < l2_price
+            if px > l1_price
+                l2_idx   := pivot_bar
+                l2_price := px
+                l2_close := close[pivot_k]
+            else
+                state    := 1
+                l1_idx   := pivot_bar
+                l1_price := px
+                h1_idx   := na
+                h1_price := na
+                l2_idx   := na
+                l2_price := na
+                l2_close := na
+
+// --- pivot high arrived ---
+if is_new_ph
+    px = ph_val
+    if state == 1
+        rise_bars = pivot_bar - l1_idx
+        if rise_bars >= min_rise_bars and rise_bars <= max_l1_h1_bars
+            state    := 2
+            h1_idx   := pivot_bar
+            h1_price := px
+    else if state == 2
+        if px > h1_price
+            h1_idx   := pivot_bar
+            h1_price := px
+
+// ============= Fire condition =============
+fire_cond = false
+if state == 3 and not na(l2_idx)
+    bars_since_l2 = bar_index - l2_idx
+    if bars_since_l2 > max_pullback_bars
+        state    := 0
+        l1_idx   := na
+        l1_price := na
+        h1_idx   := na
+        h1_price := na
+        l2_idx   := na
+        l2_price := na
+        l2_close := na
+    else if low < l1_price - eps_price_atr * atr
+        state    := 0
+        l1_idx   := na
+        l1_price := na
+        h1_idx   := na
+        h1_price := na
+        l2_idx   := na
+        l2_price := na
+        l2_close := na
+    else if bar_index > l2_idx
+        // Break-low guard: min low since l2 must not drop below L1
+        min_low_since_l2 = ta.lowest(low, math.max(1, bar_index - l2_idx + 1))
+        if min_low_since_l2 >= l1_price - eps_price_atr * atr and close > l2_close
+            rise_atr = (h1_price - l1_price) / atr
+            pull_atr = (h1_price - l2_price) / atr
+            rise_bars = h1_idx - l1_idx
+            pull_bars = l2_idx - h1_idx
+            rise_range = h1_price - l1_price
+            l2_retrace = rise_range > 0 ? (h1_price - l2_price) / rise_range : 0.0
+
+            cond_rise_atr  = rise_atr >= min_rise_atr
+            cond_pull_atr  = pull_atr >= min_pullback_atr
+            cond_rise_bars = rise_bars >= min_rise_bars
+            cond_pull_min  = pull_bars >= min_pullback_bars
+            cond_pull_max  = pull_bars <= max_pullback_bars
+            cond_l2_above  = l2_price > l1_price
+            cond_retrace_l = l2_retrace >= min_l2_retrace
+            cond_retrace_h = l2_retrace <= max_l2_retrace
+
+            fire_cond := cond_rise_atr and cond_pull_atr and cond_rise_bars and cond_pull_min and cond_pull_max and cond_l2_above and cond_retrace_l and cond_retrace_h
+
+if fire_cond
+    fire_signal := true
+    state    := 0
+    l1_idx   := na
+    l1_price := na
+    h1_idx   := na
+    h1_price := na
+    l2_idx   := na
+    l2_price := na
+    l2_close := na
+
+// ============= Visuals =============
+plotshape(fire_signal, title="IBUY2", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.normal, text="IBUY2", textcolor=color.white)
+
+// Pivot markers
+plotshape(show_points and is_new_pl, title="pivot_low", style=shape.circle, location=location.belowbar, color=color.new(color.blue, 50), size=size.tiny, offset=-pivot_k)
+plotshape(show_points and is_new_ph, title="pivot_high", style=shape.circle, location=location.abovebar, color=color.new(color.red, 50), size=size.tiny, offset=-pivot_k)
+
+// State background (lightweight hint)
+bgcolor(show_state and state == 1 ? color.new(color.blue,   92) : na, title="L1_FOUND")
+bgcolor(show_state and state == 2 ? color.new(color.aqua,   92) : na, title="H1_FOUND")
+bgcolor(show_state and state == 3 ? color.new(color.orange, 92) : na, title="L2_FOUND")
+
+// Draw L1/H1/L2 horizontal lines
+plot(show_points and not na(l1_price) ? l1_price : na, title="L1", color=color.new(color.blue, 30), style=plot.style_linebr, linewidth=2)
+plot(show_points and not na(h1_price) ? h1_price : na, title="H1", color=color.new(color.red, 30), style=plot.style_linebr, linewidth=1)
+plot(show_points and not na(l2_price) ? l2_price : na, title="L2", color=color.new(color.orange, 30), style=plot.style_linebr, linewidth=2)
+
+// ============= Alerts =============
+alertcondition(fire_signal, title="IBUY2 Fired", message="IBUY2 on {{ticker}} @ {{close}}")
+
+// ============= Strategy =============
+in_position = strategy.position_size > 0
+can_enter   = fire_signal and (not in_position)
+
+if can_enter
+    strategy.entry("IBUY2", strategy.long)
+
+if in_position and use_atr_stop
+    sl_price = strategy.position_avg_price - atr_stop_mult * atr
+    strategy.exit("IBUY2_SL", from_entry = "IBUY2", stop = sl_price)
+
+if in_position and use_target
+    tp_price = strategy.position_avg_price + target_atr_mult * atr
+    strategy.exit("IBUY2_TP", from_entry = "IBUY2", limit = tp_price)
+
+time_exceeded = in_position and use_time_stop and (bar_index - strategy.opentrades.entry_bar_index(0) >= max_hold_bars)
+if time_exceeded
+    strategy.close("IBUY2", comment = "time_stop")
+
+// ============= Debug table =============
+if barstate.islast
+    var table dbg = table.new(position.bottom_right, 2, 10, border_width=1)
+    state_str = state == 0 ? "NONE" : state == 1 ? "L1_FOUND" : state == 2 ? "H1_FOUND" : "L2_FOUND"
+    table.cell(dbg, 0, 0, "状态", bgcolor=color.gray, text_color=color.white)
+    table.cell(dbg, 1, 0, state_str, bgcolor=color.gray, text_color=color.white)
+    table.cell(dbg, 0, 1, "L1",   text_color=color.black)
+    table.cell(dbg, 1, 1, str.tostring(l1_price, "#.##"), text_color=color.black)
+    table.cell(dbg, 0, 2, "H1",   text_color=color.black)
+    table.cell(dbg, 1, 2, str.tostring(h1_price, "#.##"), text_color=color.black)
+    table.cell(dbg, 0, 3, "L2",   text_color=color.black)
+    table.cell(dbg, 1, 3, str.tostring(l2_price, "#.##"), text_color=color.black)
+    rise_atr_cur = not na(l1_price) and not na(h1_price) and atr > 0 ? (h1_price - l1_price) / atr : 0.0
+    pull_atr_cur = not na(h1_price) and not na(l2_price) and atr > 0 ? (h1_price - l2_price) / atr : 0.0
+    table.cell(dbg, 0, 4, "rise_atr", text_color=color.black)
+    table.cell(dbg, 1, 4, str.tostring(rise_atr_cur, "#.##"), text_color=color.black)
+    table.cell(dbg, 0, 5, "pull_atr", text_color=color.black)
+    table.cell(dbg, 1, 5, str.tostring(pull_atr_cur, "#.##"), text_color=color.black)
+    retrace_cur = not na(l1_price) and not na(h1_price) and not na(l2_price) and (h1_price - l1_price) > 0 ? (h1_price - l2_price) / (h1_price - l1_price) : 0.0
+    table.cell(dbg, 0, 6, "l2_retrace", text_color=color.black)
+    table.cell(dbg, 1, 6, str.tostring(retrace_cur, "#.###"), text_color=color.black)
+    table.cell(dbg, 0, 7, "ATR",  text_color=color.black)
+    table.cell(dbg, 1, 7, str.tostring(atr, "#.####"), text_color=color.black)
+    bars_in_state = state == 3 and not na(l2_idx) ? bar_index - l2_idx : 0
+    table.cell(dbg, 0, 8, "bars since L2", text_color=color.black)
+    table.cell(dbg, 1, 8, str.tostring(bars_in_state), text_color=color.black)
+    table.cell(dbg, 0, 9, "L2 > L1 ?",  text_color=color.black)
+    table.cell(dbg, 1, 9, not na(l1_price) and not na(l2_price) ? (l2_price > l1_price ? "YES" : "NO") : "-", text_color=color.black)

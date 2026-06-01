@@ -12,3 +12,6 @@ dist/
 
 data/
 outputs/
+*.env
+!*.env.example
+*.zip
